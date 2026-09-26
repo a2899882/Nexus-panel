@@ -119,8 +119,51 @@ restore() {
   echo '若迁移到新服务器，请在网站配置中更新节点后端 IP，并重新下发原版节点安装命令。'
 }
 install_panel() {
-  compose up -d --build
+  # Build one image at a time while the application is stopped, so a 1 GB VPS
+  # does not run MySQL, Java, Maven and Node concurrently.
+  compose stop frontend backend mysql >/dev/null 2>&1 || true
+  if ! compose build backend || ! compose build frontend; then
+    compose start mysql backend frontend || true
+    echo '镜像构建失败，已尝试恢复旧容器；查看上方构建日志后重新执行 mb install。' >&2
+    return 1
+  fi
+  compose up -d --no-build
   echo '面板已安装/重建，数据库卷保持不变。'
+}
+reset_admin() {
+  local password confirm hash attempt ready=0 result
+  [[ -r /dev/tty ]] || { echo '重设管理员密码需要交互式 SSH 终端。' >&2; return 1; }
+  read -r -s -p '新的管理员密码（至少 12 位）: ' password </dev/tty; echo
+  read -r -s -p '再次输入密码: ' confirm </dev/tty; echo
+  [[ ${#password} -ge 12 && $password == "$confirm" ]] || { echo '密码长度不足或两次不一致。' >&2; return 1; }
+  compose up -d mysql >/dev/null
+  for attempt in {1..30}; do
+    if compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "SELECT id FROM user WHERE id=1 AND role_id=0"' >/dev/null 2>&1; then
+      ready=1; break
+    fi
+    sleep 2
+  done
+  [[ $ready -eq 1 ]] || { echo '管理员表尚未就绪。' >&2; return 1; }
+  hash=$(printf '%s' "$password" | md5sum | cut -d' ' -f1)
+  result=$(compose exec -T mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "$1"' sh "UPDATE user SET pwd='$hash' WHERE id=1 AND role_id=0; SELECT ROW_COUNT();")
+  [[ $result == 1 ]] || { echo '未找到初始管理员账号，密码没有更改。' >&2; return 1; }
+  echo '管理员密码已更新。'
+}
+cleanup_swap() {
+  local file=/swapfile-nexus-panel used available
+  [[ -f $file && ! -L $file ]] || { echo '未发现旧版安装器创建的 swap 文件。'; return 0; }
+  used=$(awk '$1 == "/swapfile-nexus-panel" {print $4}' /proc/swaps)
+  if [[ -n $used ]]; then
+    available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    if (( available < used + 131072 )); then
+      echo '可用内存不足以安全停用旧 swap。请先停止其他任务后重试。' >&2
+      return 1
+    fi
+    swapoff "$file" || { echo 'swapoff 失败，保留原文件和开机配置。' >&2; return 1; }
+  fi
+  sed -i '\@^/swapfile-nexus-panel[[:space:]]@d' /etc/fstab
+  rm -f -- "$file"
+  echo '旧版安装器创建的 swap 文件和开机配置已移除。'
 }
 start_panel() {
   compose up -d
@@ -162,7 +205,7 @@ update_panel() {
   echo "更新前备份：$snapshot"
   git pull --ff-only
   install -m 0755 scripts/mb.sh /usr/local/bin/mb
-  compose up -d --build
+  install_panel
   echo '程序已更新，数据卷保持不变。'
 }
 status() {
@@ -175,7 +218,8 @@ menu() {
     echo
     echo 'Nexus-panel | SSH 菜单（mb）'
     echo '1) 状态  2) 升级  3) 更换域名  4) 备份  5) 恢复'
-    echo '6) 日志  7) 重启  8) 停止（保留数据）  9) 启动/重装  10) 卸载  0) 退出'
+    echo '6) 日志  7) 重启  8) 停止（保留数据）  9) 启动/重装  10) 卸载'
+    echo '11) 重设管理员密码  12) 清理旧版 swap  0) 退出'
     read -r -p '选择: ' choice
     case "$choice" in
       1) status ;;
@@ -188,6 +232,8 @@ menu() {
       8) compose down; echo '容器已停止，数据库卷与源代码已保留。' ;;
       9) install_panel ;;
       10) uninstall_panel; return ;;
+      11) reset_admin ;;
+      12) cleanup_swap ;;
       0) return ;;
       *) echo '选项无效' ;;
     esac
@@ -205,5 +251,7 @@ case ${1:-menu} in
   restart) compose restart ;;
   stop) compose down ;;
   uninstall) uninstall_panel ;;
-  *) echo '用法：mb [menu|domain|backup|restore|status|update|install|start|restart|stop|uninstall]' >&2; exit 2 ;;
+  reset-admin) reset_admin ;;
+  cleanup-swap) cleanup_swap ;;
+  *) echo '用法：mb [menu|domain|backup|restore|status|update|install|start|restart|stop|uninstall|reset-admin|cleanup-swap]' >&2; exit 2 ;;
 esac

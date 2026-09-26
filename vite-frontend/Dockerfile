@@ -1,5 +1,6 @@
 # 多阶段构建 - 构建阶段
 FROM node:20.19.0 AS builder
+ENV NODE_OPTIONS="--max-old-space-size=384"
 
 WORKDIR /app
 

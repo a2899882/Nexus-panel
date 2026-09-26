@@ -1,4 +1,4 @@
-name: nexus-panel
+version: '2.4'
 services:
   mysql:
     image: mysql:5.7
@@ -16,7 +16,7 @@ services:
       - --default-authentication-plugin=mysql_native_password
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-      - --innodb_buffer_pool_size=256M
+      - --innodb_buffer_pool_size=96M
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 10s
@@ -35,7 +35,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD}
       JWT_SECRET: ${JWT_SECRET}
       LOG_DIR: /app/logs
-      JAVA_OPTS: -Xms128m -Xmx384m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai
+      JAVA_OPTS: -Xms64m -Xmx320m -XX:MaxMetaspaceSize=192m -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai
     ports:
       - "${BACKEND_PORT:-6365}:6365"
     volumes:

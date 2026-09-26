@@ -9,12 +9,19 @@ if [[ $EUID -ne 0 ]]; then echo '请使用 root 执行安装脚本' >&2; exit 1;
 if [[ ! -r /dev/tty ]]; then echo '安装需要交互式 SSH 终端' >&2; exit 1; fi
 exec 3</dev/tty
 if ! command -v apt-get >/dev/null; then echo '当前支持 Debian/Ubuntu + systemd' >&2; exit 1; fi
+resume=0
 if [[ -f "$APP_DIR/compose.yml" && -f "$APP_DIR/.env" ]]; then
-  echo '检测到新版面板，请执行 mb install 以重建服务，或执行 mb update 升级。' >&2
-  exit 1
+  if [[ ! -d "$APP_DIR/.git" || ! -s "$APP_DIR/runtime/init.sql" ]] ||
+     [[ $(git -C "$APP_DIR" remote get-url origin 2>/dev/null) != "$REPO_URL" ]]; then
+    echo '现有目录缺少本项目的 Git 信息或初始化配置，请检查 /opt/nexus-panel；安装器不会覆盖。' >&2
+    exit 1
+  fi
+  resume=1
+  echo '检测到未完成或已有的 Nexus-panel 安装，将保留现有数据并继续安装。'
 fi
 read -r -u 3 -p '面板域名（DNS 已指向本机，不含协议）: ' domain
 [[ $domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$ ]] || { echo '域名无效' >&2; exit 1; }
+if [[ $resume -eq 0 ]]; then
 read -r -u 3 -p '节点连接后端的公网 IP 或域名（不可套 CDN）: ' backend_host
 [[ $backend_host =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && $backend_host != *..* ]] || { echo '后端地址需为 IPv4 或域名' >&2; exit 1; }
 read -r -u 3 -p '初始管理员账号 [nexus_admin]: ' admin_user
@@ -31,56 +38,43 @@ else
   generated=0
 fi
 [[ ${#admin_password} -ge 12 ]] || { echo '密码至少 12 位' >&2; exit 1; }
-
-mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
-swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
-if (( mem_kb < 2097152 && swap_kb < 3145728 )); then
-  swap_mb=$(( (3145728 - swap_kb + 1023) / 1024 ))
-  free_mb=$(df -Pm / | awk 'NR == 2 {print $4}')
-  if (( free_mb < swap_mb + 6144 )); then
-    echo "内存不足 2 GB，且磁盘空间不足以创建 ${swap_mb} MB swap 并保留 6 GB 构建空间。" >&2
-    exit 1
-  fi
-  swap_file=/swapfile-nexus-panel
-  if [[ -e $swap_file ]]; then
-    echo "$swap_file 已存在，请先检查现有 swap 配置。" >&2
-    exit 1
-  fi
-  echo "内存不足 2 GB，正在创建 ${swap_mb} MB swap 供构建和运行使用。"
-  if ! dd if=/dev/zero of="$swap_file" bs=1M count="$swap_mb" status=none \
-      || ! chmod 0600 "$swap_file" \
-      || ! mkswap "$swap_file" >/dev/null \
-      || ! swapon "$swap_file"; then
-    swapoff "$swap_file" 2>/dev/null || true
-    rm -f "$swap_file"
-    echo 'swap 创建失败，请检查文件系统和可用磁盘。' >&2
-    exit 1
-  fi
-  printf '%s\n' "$swap_file none swap sw 0 0" >> /etc/fstab
 fi
 
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates openssl docker.io caddy python3
 if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null; then
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin \
-    || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-v2 \
-    || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose
+  if apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin
+  elif apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-v2
+  else
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose
+  fi
 fi
-if [[ -e $APP_DIR || -L $APP_DIR || -e /var/lib/nexus-panel || -f /etc/systemd/system/nexus-panel.service ||
+if [[ $resume -eq 0 ]] &&
+   [[ -e $APP_DIR || -L $APP_DIR || -e /var/lib/nexus-panel || -f /etc/systemd/system/nexus-panel.service ||
       -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain || -L /usr/local/bin/nexus-panel ]]; then
   curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/scripts/legacy_cleanup.sh \
     -o /root/nexus-panel-legacy-cleanup.sh
   bash /root/nexus-panel-legacy-cleanup.sh
   rm -f /root/nexus-panel-legacy-cleanup.sh
 fi
-if [[ -d $APP_DIR && -n $(ls -A "$APP_DIR") ]] ||
+if [[ $resume -eq 0 ]] && { [[ -d $APP_DIR && -n $(ls -A "$APP_DIR") ]] ||
    [[ -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain ]] ||
-   systemctl is-active --quiet nexus-panel 2>/dev/null; then
+   systemctl is-active --quiet nexus-panel 2>/dev/null; }; then
   echo '检测到尚未清理的旧面板或其他安装，已停止，未覆盖任何数据。' >&2
   exit 1
 fi
 
 systemctl enable --now docker
+if [[ $resume -eq 1 ]]; then
+  git -C "$APP_DIR" pull --ff-only
+  install -m 0755 "$APP_DIR/scripts/mb.sh" /usr/local/bin/mb
+  mb install
+  mb domain "$domain"
+  echo '已继续安装，原数据库和凭证保留。如忘记初始密码，可执行 mb reset-admin。'
+  exit 0
+fi
 mkdir -p "$APP_DIR"
 git clone --depth=1 "$REPO_URL" "$APP_DIR"
 cd "$APP_DIR"
@@ -102,18 +96,13 @@ EOF
 NEXUS_ADMIN_USER="$admin_user" NEXUS_ADMIN_PASSWORD="$admin_password" \
 NEXUS_BACKEND_ADDRESS="$backend_host:6365" python3 scripts/render_sql.py gost.sql runtime/init.sql
 
-if docker compose version >/dev/null 2>&1; then
-  docker compose -f compose.yml up -d --build
-else
-  docker-compose -f compose.yml up -d --build
-fi
-
 install -m 0755 scripts/mb.sh /usr/local/bin/mb
+echo "初始账号：$admin_user"
+if [[ $generated -eq 1 ]]; then echo "初始密码（仅显示一次，请保存）：$admin_password"; fi
+mb install
 bash scripts/mb.sh domain "$domain"
 
 echo "面板：https://$domain"
 echo "节点后端：$backend_host:6365（请仅向节点放行此 TCP 端口）"
-echo "初始账号：$admin_user"
-if [[ $generated -eq 1 ]]; then echo "初始密码（仅显示一次）：$admin_password"; fi
 echo 'SSH 管理菜单：mb'
 echo '安装完成后可在“网站配置”修改面板名称、后端节点地址，在账号菜单修改密码。'

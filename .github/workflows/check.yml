@@ -18,6 +18,11 @@ jobs:
         run: |
           bash -n panel_install.sh scripts/mb.sh scripts/legacy_cleanup.sh
           python3 -m py_compile scripts/*.py
+      - name: Check Debian 12 docker-compose v1 deployment config
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src \
+            -e DB_NAME=ci -e DB_USER=ci -e DB_PASSWORD=ci -e JWT_SECRET=ci \
+            debian:12-slim sh -ec 'apt-get update -qq && apt-get install -y -qq docker-compose >/dev/null && docker-compose -f compose.yml config >/dev/null'
       - name: Build frontend
         working-directory: vite-frontend
         run: npm install --legacy-peer-deps && npm run build
