@@ -13,24 +13,6 @@ if [[ -f "$APP_DIR/compose.yml" && -f "$APP_DIR/.env" ]]; then
   echo '检测到新版面板，请执行 mb install 以重建服务，或执行 mb update 升级。' >&2
   exit 1
 fi
-if [[ -e $APP_DIR || -L $APP_DIR || -e /var/lib/nexus-panel || -f /etc/systemd/system/nexus-panel.service ||
-      -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain || -L /usr/local/bin/nexus-panel ]]; then
-  if ! command -v curl >/dev/null; then
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates
-  fi
-  curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/scripts/legacy_cleanup.sh \
-    -o /root/nexus-panel-legacy-cleanup.sh
-  bash /root/nexus-panel-legacy-cleanup.sh
-  rm -f /root/nexus-panel-legacy-cleanup.sh
-fi
-if [[ -d $APP_DIR && -n $(ls -A "$APP_DIR") ]] ||
-   [[ -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain ]] ||
-   systemctl is-active --quiet nexus-panel 2>/dev/null; then
-  echo '检测到尚未清理的旧面板或其他安装，已停止，未覆盖任何数据。' >&2
-  exit 1
-fi
-
 read -r -u 3 -p '面板域名（DNS 已指向本机，不含协议）: ' domain
 [[ $domain =~ ^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$ ]] || { echo '域名无效' >&2; exit 1; }
 read -r -u 3 -p '节点连接后端的公网 IP 或域名（不可套 CDN）: ' backend_host
@@ -84,6 +66,20 @@ if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev
     || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-v2 \
     || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose
 fi
+if [[ -e $APP_DIR || -L $APP_DIR || -e /var/lib/nexus-panel || -f /etc/systemd/system/nexus-panel.service ||
+      -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain || -L /usr/local/bin/nexus-panel ]]; then
+  curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/scripts/legacy_cleanup.sh \
+    -o /root/nexus-panel-legacy-cleanup.sh
+  bash /root/nexus-panel-legacy-cleanup.sh
+  rm -f /root/nexus-panel-legacy-cleanup.sh
+fi
+if [[ -d $APP_DIR && -n $(ls -A "$APP_DIR") ]] ||
+   [[ -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain ]] ||
+   systemctl is-active --quiet nexus-panel 2>/dev/null; then
+  echo '检测到尚未清理的旧面板或其他安装，已停止，未覆盖任何数据。' >&2
+  exit 1
+fi
+
 systemctl enable --now docker
 mkdir -p "$APP_DIR"
 git clone --depth=1 "$REPO_URL" "$APP_DIR"
