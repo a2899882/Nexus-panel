@@ -24,3 +24,10 @@ jobs:
       - name: Build backend
         working-directory: springboot-backend
         run: mvn -B -DskipTests package
+      - name: Build deployment images
+        env:
+          DB_NAME: ci
+          DB_USER: ci
+          DB_PASSWORD: ci
+          JWT_SECRET: ci
+        run: docker compose -f compose.yml build backend frontend

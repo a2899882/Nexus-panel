@@ -48,7 +48,8 @@ backup() {
   tmp=$(mktemp -d)
   target="/root/nexus-panel-backup-$(date +%Y%m%d-%H%M%S)-$$.tar.gz"
   if ! compose exec -T mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --routines --events --default-character-set=utf8mb4 "$MYSQL_DATABASE"' > "$tmp/panel.sql"; then
-    rmdir "$tmp" 2>/dev/null || true
+    rm -f "$tmp/panel.sql"
+    rmdir "$tmp"
     echo '数据库导出失败，未生成备份' >&2
     return 1
   fi
@@ -75,7 +76,8 @@ restore() {
   [[ -f $archive ]] || { echo '备份包不存在' >&2; return 1; }
   tmp=$(mktemp -d)
   if ! python3 "$APP_DIR/scripts/validate_backup.py" "$archive" "$tmp"; then
-    rmdir "$tmp" 2>/dev/null || true
+    rm -f "$tmp/panel.sql" "$tmp/env.snapshot" "$tmp/domain.txt" "$tmp/manifest.txt"
+    rmdir "$tmp"
     return 1
   fi
   safety=$(backup)
@@ -88,10 +90,16 @@ restore() {
     python3 "$APP_DIR/scripts/validate_backup.py" "$safety" "$rollback"
     import_sql "$rollback/panel.sql" || true
     compose start backend frontend || true
+    rm -f "$rollback/panel.sql" "$rollback/env.snapshot" "$rollback/domain.txt" "$rollback/manifest.txt"
+    rmdir "$rollback"
+    rm -f "$tmp/panel.sql" "$tmp/env.snapshot" "$tmp/domain.txt" "$tmp/manifest.txt"
+    rmdir "$tmp"
     echo "请检查快照：$safety" >&2
     return 1
   fi
   compose start backend frontend
+  rm -f "$tmp/panel.sql" "$tmp/env.snapshot" "$tmp/domain.txt" "$tmp/manifest.txt"
+  rmdir "$tmp"
   echo '数据库已恢复。当前服务器的域名和数据库凭证保持不变。'
   echo '若迁移到新服务器，请在网站配置中更新节点后端 IP，并重新下发原版节点安装命令。'
 }
