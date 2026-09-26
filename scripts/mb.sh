@@ -4,7 +4,7 @@ set -euo pipefail
 APP_DIR=/opt/nexus-panel
 DOMAIN_FILE=/etc/nexus-panel-domain
 CADDY_SITE=/etc/caddy/nexus-panel.caddy
-[[ $EUID -eq 0 ]] || { echo '请使用 root 执行：sudo mb' >&2; exit 1; }
+[[ $EUID -eq 0 ]] || { echo '请使用 root 登录后执行：mb' >&2; exit 1; }
 [[ -f "$APP_DIR/compose.yml" && -f "$APP_DIR/.env" ]] || { echo '未找到 Nexus-panel 安装配置' >&2; exit 1; }
 cd "$APP_DIR"
 

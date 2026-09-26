@@ -41,6 +41,33 @@ else
 fi
 [[ ${#admin_password} -ge 12 ]] || { echo '密码至少 12 位' >&2; exit 1; }
 
+mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+if (( mem_kb < 2097152 && swap_kb < 3145728 )); then
+  swap_mb=$(( (3145728 - swap_kb + 1023) / 1024 ))
+  free_mb=$(df -Pm / | awk 'NR == 2 {print $4}')
+  if (( free_mb < swap_mb + 6144 )); then
+    echo "内存不足 2 GB，且磁盘空间不足以创建 ${swap_mb} MB swap 并保留 6 GB 构建空间。" >&2
+    exit 1
+  fi
+  swap_file=/swapfile-nexus-panel
+  if [[ -e $swap_file ]]; then
+    echo "$swap_file 已存在，请先检查现有 swap 配置。" >&2
+    exit 1
+  fi
+  echo "内存不足 2 GB，正在创建 ${swap_mb} MB swap 供构建和运行使用。"
+  if ! dd if=/dev/zero of="$swap_file" bs=1M count="$swap_mb" status=none \
+      || ! chmod 0600 "$swap_file" \
+      || ! mkswap "$swap_file" >/dev/null \
+      || ! swapon "$swap_file"; then
+    swapoff "$swap_file" 2>/dev/null || true
+    rm -f "$swap_file"
+    echo 'swap 创建失败，请检查文件系统和可用磁盘。' >&2
+    exit 1
+  fi
+  printf '%s\n' "$swap_file none swap sw 0 0" >> /etc/fstab
+fi
+
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git curl ca-certificates openssl docker.io caddy python3
 if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null; then
@@ -83,5 +110,5 @@ echo "面板：https://$domain"
 echo "节点后端：$backend_host:6365（请仅向节点放行此 TCP 端口）"
 echo "初始账号：$admin_user"
 if [[ $generated -eq 1 ]]; then echo "初始密码（仅显示一次）：$admin_password"; fi
-echo 'SSH 管理菜单：sudo mb'
+echo 'SSH 管理菜单：mb'
 echo '安装完成后可在“网站配置”修改面板名称、后端节点地址，在账号菜单修改密码。'
