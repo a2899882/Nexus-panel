@@ -2,6 +2,7 @@
 """Nexus-panel control plane: Python standard library only."""
 import argparse
 import base64
+import decimal
 import hashlib
 import hmac
 import http.cookies
@@ -52,20 +53,36 @@ def init_db():
         c.executescript('''
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', grp TEXT NOT NULL DEFAULT '', token_hash TEXT UNIQUE NOT NULL, last_seen INTEGER NOT NULL DEFAULT 0, version TEXT NOT NULL DEFAULT '', applied_revision INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', realm_running INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', grp TEXT NOT NULL DEFAULT '', token_hash TEXT UNIQUE NOT NULL, enroll_hash TEXT, enroll_expires INTEGER NOT NULL DEFAULT 0, cert_fp TEXT NOT NULL DEFAULT '', last_seen INTEGER NOT NULL DEFAULT 0, version TEXT NOT NULL DEFAULT '', applied_revision INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', realm_running INTEGER NOT NULL DEFAULT 0, tunnel_running INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, name TEXT NOT NULL, grp TEXT NOT NULL DEFAULT '', listen_host TEXT NOT NULL DEFAULT '0.0.0.0', listen_port INTEGER NOT NULL, remote_host TEXT NOT NULL, remote_port INTEGER NOT NULL, protocol TEXT NOT NULL CHECK(protocol IN ('tcp','udp','both')), extra_remotes TEXT NOT NULL DEFAULT '[]', balance TEXT NOT NULL DEFAULT 'off', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, quota_bytes INTEGER NOT NULL DEFAULT 0, speed_bps INTEGER NOT NULL DEFAULT 0, billing TEXT NOT NULL DEFAULT 'both', ratio_bp INTEGER NOT NULL DEFAULT 10000, price_cents_per_gb INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, used_bytes INTEGER NOT NULL DEFAULT 0, up_bytes INTEGER NOT NULL DEFAULT 0, down_bytes INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS tunnels(id INTEGER PRIMARY KEY, name TEXT NOT NULL, account_id INTEGER NOT NULL UNIQUE REFERENCES accounts(id), entry_id INTEGER NOT NULL REFERENCES nodes(id), relay_id INTEGER NOT NULL REFERENCES nodes(id), exit_id INTEGER NOT NULL REFERENCES nodes(id), entry_port INTEGER NOT NULL, relay_port INTEGER NOT NULL, exit_port INTEGER NOT NULL, target_host TEXT NOT NULL, target_port INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS tunnel_usage(tunnel_id INTEGER NOT NULL, node_id INTEGER NOT NULL, epoch TEXT NOT NULL, up_bytes INTEGER NOT NULL, down_bytes INTEGER NOT NULL, billed_bytes INTEGER NOT NULL, PRIMARY KEY(tunnel_id,node_id,epoch));
         CREATE INDEX IF NOT EXISTS idx_rules_node ON rules(node_id);
         CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at);
         ''')
         columns={r['name'] for r in c.execute('PRAGMA table_info(rules)')}
         if 'extra_remotes' not in columns: c.execute("ALTER TABLE rules ADD COLUMN extra_remotes TEXT NOT NULL DEFAULT '[]'")
         if 'balance' not in columns: c.execute("ALTER TABLE rules ADD COLUMN balance TEXT NOT NULL DEFAULT 'off'")
+        node_columns={r['name'] for r in c.execute('PRAGMA table_info(nodes)')}
+        if 'enroll_hash' not in node_columns: c.execute('ALTER TABLE nodes ADD COLUMN enroll_hash TEXT')
+        if 'enroll_expires' not in node_columns: c.execute('ALTER TABLE nodes ADD COLUMN enroll_expires INTEGER NOT NULL DEFAULT 0')
+        if 'cert_fp' not in node_columns: c.execute("ALTER TABLE nodes ADD COLUMN cert_fp TEXT NOT NULL DEFAULT ''")
+        if 'tunnel_running' not in node_columns: c.execute('ALTER TABLE nodes ADD COLUMN tunnel_running INTEGER NOT NULL DEFAULT 0')
+        if 'price_cents_per_gb' not in {r['name'] for r in c.execute('PRAGMA table_info(accounts)')}:
+            c.execute('ALTER TABLE accounts ADD COLUMN price_cents_per_gb INTEGER NOT NULL DEFAULT 0')
         c.execute("INSERT OR IGNORE INTO settings VALUES ('revision','1')")
         c.execute("INSERT OR IGNORE INTO settings VALUES ('retention_days','30')")
         c.execute('DELETE FROM sessions WHERE expires<?', (now(),))
         c.execute('DELETE FROM events WHERE created_at<?', (now()-30*86400,))
+    key_path=DB_PATH.parent/'master.key'
+    if not key_path.exists():
+        try:
+            fd=os.open(key_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'wb') as f: f.write(secrets.token_bytes(32))
+        except FileExistsError: pass
 
 def event(c, actor, action, detail=''):
     c.execute('INSERT INTO events(created_at,actor,action,detail) VALUES(?,?,?,?)', (now(), actor, action, detail[:200]))
@@ -74,6 +91,12 @@ def event(c, actor, action, detail=''):
 def bump(c):
     c.execute("UPDATE settings SET value=CAST(value AS INTEGER)+1 WHERE key='revision'")
 def revision(c): return int(c.execute("SELECT value FROM settings WHERE key='revision'").fetchone()[0])
+def route_secret(tid):
+    return hmac.new((DB_PATH.parent/'master.key').read_bytes(),f'tunnel:{tid}'.encode(),hashlib.sha256).hexdigest()
+def enrollment(c,nid):
+    ticket=secrets.token_urlsafe(32)
+    c.execute('UPDATE nodes SET enroll_hash=?, enroll_expires=? WHERE id=?',(digest(ticket),now()+1800,nid))
+    return ticket
 def fail(message, status=400): raise APIError(message, status)
 class APIError(Exception):
     def __init__(self, message, status=400): super().__init__(message); self.status=status
@@ -128,6 +151,9 @@ def rule_data(data):
 def conflict(c, node_id, r, ignore=0):
     # Overlapping TCP/UDP modes on a node cannot bind the same port and address.
     rows = c.execute('SELECT * FROM rules WHERE node_id=? AND id!=?',(node_id,ignore)).fetchall()
+    for route in c.execute('SELECT * FROM tunnels WHERE entry_id=? OR relay_id=? OR exit_id=?',(node_id,node_id,node_id)):
+        if any(route[role+'_id']==node_id and route[role+'_port']==r['listen_port'] for role in ('entry','relay','exit')) and r['protocol']!='udp':
+            fail(f'端口 {r["listen_port"]} 与隧道「{route["name"]}」冲突',409)
     for row in rows:
         if row['listen_port']!=r['listen_port']: continue
         if row['listen_host']!=r['listen_host'] and row['listen_host'] not in ('0.0.0.0','::') and r['listen_host'] not in ('0.0.0.0','::'): continue
@@ -135,9 +161,80 @@ def conflict(c, node_id, r, ignore=0):
             fail(f'端口 {r["listen_port"]} 与现有规则「{row["name"]}」冲突',409)
 
 def clean_node(row):
-    return {k:row[k] for k in ('id','name','address','grp','last_seen','version','applied_revision','error','realm_running')}
+    return {k:row[k] for k in ('id','name','address','grp','last_seen','version','applied_revision','error','realm_running','tunnel_running','cert_fp')}
 def clean_rule(row):
     result=dict(row); result['extra_remotes']=json.loads(result['extra_remotes']); return result
+def clean_account(row):
+    account=dict(row)
+    account['amount_cents']=account['used_bytes']*account['price_cents_per_gb']//1024**3
+    return account
+def clean_tunnel(row): return dict(row)
+def tunnel_data(c,data,ignore=0):
+    name=required_string(data,'name',80)
+    try: aid=int(data.get('account_id')); ids=[int(data[k]) for k in ('entry_id','relay_id','exit_id')]
+    except (ValueError,TypeError,KeyError): fail('请选择账号及前置、中转、落地服务器')
+    if len(set(ids))!=3: fail('前置、中转、落地必须是三台不同服务器')
+    account=c.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
+    if not account: fail('账号不存在')
+    if c.execute('SELECT 1 FROM tunnels WHERE account_id=? AND id!=?',(aid,ignore)).fetchone(): fail('一个账号只能绑定一条隧道',409)
+    for nid in ids:
+        node=c.execute('SELECT * FROM nodes WHERE id=?',(nid,)).fetchone()
+        if not node or not node['address']: fail('三个节点都必须填写可互通的公网或内网地址')
+    ports=[port(data,k) for k in ('entry_port','relay_port','exit_port')]
+    for nid,p in zip(ids,ports):
+        if c.execute("SELECT 1 FROM rules WHERE node_id=? AND listen_port=? AND protocol!='udp'",(nid,p)).fetchone(): fail(f'端口 {p} 与现有 Realm 规则冲突',409)
+        for other in c.execute('SELECT * FROM tunnels WHERE id!=?',(ignore,)):
+            if (other['entry_id']==nid and other['entry_port']==p or other['relay_id']==nid and other['relay_port']==p or other['exit_id']==nid and other['exit_port']==p): fail(f'端口 {p} 已被隧道使用',409)
+    enabled=data.get('enabled',True)
+    if not isinstance(enabled,bool): fail('enabled 必须是布尔值')
+    return dict(name=name,account_id=aid,entry_id=ids[0],relay_id=ids[1],exit_id=ids[2],entry_port=ports[0],relay_port=ports[1],exit_port=ports[2],target_host=valid_host(required_string(data,'target_host',253)),target_port=port(data,'target_port'),enabled=int(enabled))
+def account_data(data):
+    name=required_string(data,'name',80)
+    billing=data.get('billing')
+    if billing not in ('up','down','both'): fail('计费方向必须是上行、下行或双向')
+    enabled=data.get('enabled',True)
+    if not isinstance(enabled,bool): fail('enabled 必须是布尔值')
+    try:
+        quota=int(data.get('quota_gb') or 0); speed=int(data.get('speed_mbps') or 0)
+        ratio=float(data.get('ratio') or 1)
+        price=decimal.Decimal(str(data.get('price_per_gb') or '0'))
+    except (ValueError,TypeError,decimal.InvalidOperation): fail('配额、限速、倍率或单价格式无效')
+    if not 0<=quota<=100000 or not 0<=speed<=100000 or not .1<=ratio<=10 or not price.is_finite() or not 0<=price<=100000 or price.as_tuple().exponent < -2: fail('配额/限速范围无效，倍率需为 0.1–10，单价最多两位小数')
+    return dict(name=name,quota_bytes=quota*1024**3,speed_bps=speed*1000000//8,billing=billing,ratio_bp=round(ratio*10000),price_cents_per_gb=int(price*100),enabled=int(enabled))
+def desired_tunnels(c,node_id):
+    result=[]
+    for route in c.execute('SELECT * FROM tunnels WHERE enabled=1 AND (entry_id=? OR relay_id=? OR exit_id=?)',(node_id,node_id,node_id)):
+        account=c.execute('SELECT * FROM accounts WHERE id=?',(route['account_id'],)).fetchone()
+        nodes={r['id']:r for r in c.execute('SELECT * FROM nodes WHERE id IN (?,?,?)',(route['entry_id'],route['relay_id'],route['exit_id']))}
+        if not account or not account['enabled'] or len(nodes)!=3 or any(not n['cert_fp'] or not n['address'] for n in nodes.values()): continue
+        role='entry' if node_id==route['entry_id'] else 'relay' if node_id==route['relay_id'] else 'exit'
+        listen_port=route[role+'_port']
+        config={'id':route['id'],'role':role,'listen':'0.0.0.0:'+str(listen_port),'secret':route_secret(route['id'])}
+        if role!='exit':
+            next_role='relay' if role=='entry' else 'exit'
+            next_node=nodes[route[next_role+'_id']]
+            config.update(next_host=next_node['address'],next_port=route[next_role+'_port'],next_fp=next_node['cert_fp'])
+        else: config.update(target_host=route['target_host'],target_port=route['target_port'])
+        if role=='entry':
+            config.update(quota_bytes=account['quota_bytes'],speed_bps=account['speed_bps'],billing=account['billing'],ratio_bp=account['ratio_bp'],used_bytes=account['used_bytes'])
+        result.append(config)
+    return result
+def receive_usage(c,node_id,records):
+    if not isinstance(records,list) or len(records)>1000: fail('流量报告过大')
+    for item in records:
+        if not isinstance(item,dict): continue
+        try:
+            tid=int(item['route_id']); epoch=str(item['epoch'])
+            up=int(item['up']); down=int(item['down']); billed=int(item['billed'])
+        except (ValueError,TypeError,KeyError): continue
+        if not re.fullmatch(r'[a-f0-9]{32}',epoch) or min(up,down,billed)<0 or max(up,down,billed)>2**60: continue
+        route=c.execute('SELECT * FROM tunnels WHERE id=? AND entry_id=?',(tid,node_id)).fetchone()
+        if not route: continue
+        old=c.execute('SELECT * FROM tunnel_usage WHERE tunnel_id=? AND node_id=? AND epoch=?',(tid,node_id,epoch)).fetchone()
+        prev=(old['up_bytes'],old['down_bytes'],old['billed_bytes']) if old else (0,0,0)
+        if up<prev[0] or down<prev[1] or billed<prev[2]: continue
+        c.execute('INSERT INTO tunnel_usage VALUES(?,?,?,?,?,?) ON CONFLICT(tunnel_id,node_id,epoch) DO UPDATE SET up_bytes=?,down_bytes=?,billed_bytes=?',(tid,node_id,epoch,up,down,billed,up,down,billed))
+        c.execute('UPDATE accounts SET up_bytes=up_bytes+?,down_bytes=down_bytes+?,used_bytes=used_bytes+? WHERE id=?',(up-prev[0],down-prev[1],billed-prev[2],route['account_id']))
 def cleanup(c):
     days = int(c.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()[0])
     c.execute('DELETE FROM events WHERE created_at<?',(now()-days*86400,))
@@ -162,8 +259,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def reply(self, data, status=200, cookie=None):
         self.send_bytes(status,json.dumps(data,ensure_ascii=False,separators=(',',':')).encode(),cookie=cookie)
     def body(self):
-        length = int(self.headers.get('Content-Length','0'))
-        if length<1 or length>65536: fail('请求体大小无效',413)
+        try: length = int(self.headers.get('Content-Length','0'))
+        except ValueError: fail('请求体大小无效',413)
+        if length<1 or length>262144: fail('请求体大小无效',413)
         try:
             data=json.loads(self.rfile.read(length))
             if not isinstance(data,dict): raise ValueError()
@@ -202,14 +300,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_bytes(200,(WEB/name).read_bytes(),kind)
         if not path.startswith('/api/'): fail('未找到',404)
         data=self.body() if method in ('POST','PUT','PATCH') else {}
+        if path=='/api/agent/enroll' and method=='POST':
+            ticket=data.get('ticket')
+            if not isinstance(ticket,str) or not 30<=len(ticket)<=100: fail('安装码无效',401)
+            with LOCK,connect() as c:
+                node=c.execute('SELECT * FROM nodes WHERE enroll_hash=? AND enroll_expires>?',(digest(ticket),now())).fetchone()
+                if not node: fail('安装码已过期或使用过，请从面板重新生成',401)
+                token=secrets.token_urlsafe(40)
+                c.execute('UPDATE nodes SET token_hash=?,enroll_hash=NULL,enroll_expires=0,last_seen=0 WHERE id=?',(digest(token),node['id']))
+                return self.reply({'token':token,'node_id':node['id']})
         if path.startswith('/api/agent/'):
             with LOCK, connect() as c:
                 node=self.agent_auth(c)
                 if path=='/api/agent/poll' and method=='POST':
+                    fp=data.get('cert_fp','')
+                    if not isinstance(fp,str) or (fp and not re.fullmatch(r'[a-f0-9]{64}',fp)): fail('节点证书指纹无效')
+                    receive_usage(c,node['id'],data.get('usage',[]))
                     rules=c.execute('SELECT * FROM rules WHERE node_id=? AND enabled=1 ORDER BY id',(node['id'],)).fetchall()
                     desired=[{'id':r['id'],'listen':addr(r['listen_host'],r['listen_port']),'remote':addr(r['remote_host'],r['remote_port']),'protocol':r['protocol'],'extra_remotes':json.loads(r['extra_remotes']),'balance':r['balance']} for r in rules]
-                    c.execute('UPDATE nodes SET last_seen=?,version=?,applied_revision=?,error=?,realm_running=? WHERE id=?', (now(),str(data.get('version',''))[:32],int(data.get('applied_revision') or 0),str(data.get('error',''))[:240],int(bool(data.get('realm_running'))),node['id']))
-                    return self.reply({'revision':revision(c),'rules':desired})
+                    c.execute('UPDATE nodes SET last_seen=?,version=?,applied_revision=?,error=?,realm_running=?,tunnel_running=?,cert_fp=? WHERE id=?', (now(),str(data.get('version',''))[:32],int(data.get('applied_revision') or 0),str(data.get('error',''))[:240],int(bool(data.get('realm_running'))),int(bool(data.get('tunnel_running'))),fp,node['id']))
+                    return self.reply({'revision':revision(c),'rules':desired,'tunnels':desired_tunnels(c,node['id'])})
                 fail('未找到',404)
         if path=='/api/login' and method=='POST':
             self.csrf()
@@ -237,15 +347,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 nodes=c.execute('SELECT * FROM nodes ORDER BY id DESC').fetchall()
                 rules=c.execute('SELECT * FROM rules ORDER BY id DESC').fetchall()
                 events=c.execute('SELECT * FROM events ORDER BY id DESC LIMIT 20').fetchall()
-                return self.reply({'nodes':[clean_node(n) for n in nodes], 'rules':[clean_rule(r) for r in rules], 'events':[dict(e) for e in events], 'revision':revision(c), 'retention_days':int(c.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()[0])})
+                return self.reply({'nodes':[clean_node(n) for n in nodes], 'rules':[clean_rule(r) for r in rules], 'accounts':[clean_account(a) for a in c.execute('SELECT * FROM accounts ORDER BY id DESC')], 'tunnels':[clean_tunnel(t) for t in c.execute('SELECT * FROM tunnels ORDER BY id DESC')], 'events':[dict(e) for e in events], 'revision':revision(c), 'retention_days':int(c.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()[0])})
             if path=='/api/nodes' and method=='POST':
                 name=required_string(data,'name',80); address=str(data.get('address') or '').strip(); grp=str(data.get('grp') or '').strip()
                 if len(address)>253 or len(grp)>60: fail('地址或分组过长')
                 if address: valid_host(address)
                 token=secrets.token_urlsafe(40)
                 cur=c.execute('INSERT INTO nodes(name,address,grp,token_hash) VALUES(?,?,?,?)',(name,address,grp,digest(token)))
+                ticket=enrollment(c,cur.lastrowid)
                 event(c,user['username'],'添加服务器',name); bump(c)
-                return self.reply({'id':cur.lastrowid,'token':token},201)
+                return self.reply({'id':cur.lastrowid,'ticket':ticket},201)
             if path.startswith('/api/nodes/'):
                 tail=path.split('/')[3:]
                 if not tail or not tail[0].isdigit(): fail('未找到',404)
@@ -256,6 +367,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     c.execute('UPDATE nodes SET token_hash=?, last_seen=0 WHERE id=?',(digest(token),nid))
                     event(c,user['username'],'重置节点密钥',node['name'])
                     return self.reply({'token':token})
+                if len(tail)==2 and tail[1]=='enrollment' and method=='POST':
+                    ticket=enrollment(c,nid)
+                    event(c,user['username'],'生成节点安装码',node['name'])
+                    return self.reply({'ticket':ticket})
                 if len(tail)==1 and method=='PUT':
                     name=required_string(data,'name',80); address=str(data.get('address') or '').strip(); grp=str(data.get('grp') or '').strip()
                     if len(address)>253 or len(grp)>60: fail('地址或分组过长')
@@ -266,11 +381,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(tail)==1 and method=='DELETE':
                     if c.execute('SELECT 1 FROM rules WHERE node_id=? LIMIT 1',(nid,)).fetchone():
                         fail('请先删除该服务器的所有规则，并等待节点应用空配置',409)
+                    if c.execute('SELECT 1 FROM tunnels WHERE entry_id=? OR relay_id=? OR exit_id=?',(nid,nid,nid)).fetchone(): fail('请先删除关联的隧道',409)
                     if node['last_seen'] and node['applied_revision']!=revision(c):
                         fail('节点尚未确认规则已清空；请等待同步，离线节点需先在服务器停用代理',409)
                     c.execute('DELETE FROM nodes WHERE id=?',(nid,)); bump(c)
                     event(c,user['username'],'删除服务器',node['name'])
                     return self.reply({'ok':True})
+            if path=='/api/accounts' and method=='POST':
+                a=account_data(data)
+                cur=c.execute('INSERT INTO accounts(name,quota_bytes,speed_bps,billing,ratio_bp,price_cents_per_gb,enabled) VALUES(?,?,?,?,?,?,?)',tuple(a.values()))
+                bump(c); event(c,user['username'],'添加隧道账号',a['name']); return self.reply({'id':cur.lastrowid},201)
+            if path.startswith('/api/accounts/'):
+                tail=path.split('/')[3:]
+                if len(tail)!=1 or not tail[0].isdigit(): fail('未找到',404)
+                aid=int(tail[0]); old=c.execute('SELECT * FROM accounts WHERE id=?',(aid,)).fetchone()
+                if not old: fail('账号不存在',404)
+                if method=='PUT':
+                    a=account_data(data)
+                    c.execute('UPDATE accounts SET name=?,quota_bytes=?,speed_bps=?,billing=?,ratio_bp=?,price_cents_per_gb=?,enabled=? WHERE id=?',(*a.values(),aid))
+                    bump(c); event(c,user['username'],'编辑隧道账号',a['name']); return self.reply({'ok':True})
+                if method=='DELETE':
+                    if c.execute('SELECT 1 FROM tunnels WHERE account_id=?',(aid,)).fetchone(): fail('请先删除账号关联的隧道',409)
+                    c.execute('DELETE FROM accounts WHERE id=?',(aid,)); bump(c)
+                    event(c,user['username'],'删除隧道账号',old['name']); return self.reply({'ok':True})
+            if path=='/api/tunnels' and method=='POST':
+                t=tunnel_data(c,data)
+                cur=c.execute('INSERT INTO tunnels(name,account_id,entry_id,relay_id,exit_id,entry_port,relay_port,exit_port,target_host,target_port,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(*t.values(),now()))
+                bump(c); event(c,user['username'],'添加三节点隧道',t['name']); return self.reply({'id':cur.lastrowid},201)
+            if path.startswith('/api/tunnels/'):
+                tail=path.split('/')[3:]
+                if len(tail)!=1 or not tail[0].isdigit(): fail('未找到',404)
+                tid=int(tail[0]); old=c.execute('SELECT * FROM tunnels WHERE id=?',(tid,)).fetchone()
+                if not old: fail('隧道不存在',404)
+                if method=='PUT':
+                    t=tunnel_data(c,data,tid)
+                    if t['account_id']!=old['account_id']: fail('隧道绑定账号不可更换，请新建隧道',409)
+                    c.execute('UPDATE tunnels SET name=?,account_id=?,entry_id=?,relay_id=?,exit_id=?,entry_port=?,relay_port=?,exit_port=?,target_host=?,target_port=?,enabled=? WHERE id=?',(*t.values(),tid))
+                    bump(c); event(c,user['username'],'编辑三节点隧道',t['name']); return self.reply({'ok':True})
+                if method=='DELETE':
+                    c.execute('DELETE FROM tunnels WHERE id=?',(tid,)); bump(c)
+                    event(c,user['username'],'删除三节点隧道',old['name']); return self.reply({'ok':True})
             if path=='/api/rules' and method=='POST':
                 nid=data.get('node_id')
                 if isinstance(nid,bool) or not str(nid).isdigit() or not c.execute('SELECT 1 FROM nodes WHERE id=?',(int(nid),)).fetchone(): fail('请选择服务器')

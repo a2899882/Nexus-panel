@@ -16,7 +16,8 @@ import os,sqlite3,sys
 src=sqlite3.connect(os.environ['NEXUS_DB']); dst=sqlite3.connect(sys.argv[1]); src.backup(dst); dst.close(); src.close()
 PY
   cp /etc/nexus-panel-domain "$temp/domain"
-  tar -czf "$target" -C "$temp" panel.db domain
+  cp "$DATA_DIR/master.key" "$temp/master.key"
+  tar -czf "$target" -C "$temp" panel.db domain master.key
   chmod 0600 "$target"
   echo "备份完成: $target（包含账号散列及节点密钥散列，请妥善保管）"
 )
@@ -30,7 +31,7 @@ import os,tarfile,sys
 p,d=sys.argv[1:]
 with tarfile.open(p,'r:gz') as t:
     names=set(t.getnames())
-    if names!={'panel.db','domain'} or any(not x.isfile() or x.size>100_000_000 for x in t): sys.exit('备份包格式无效')
+    if names not in ({'panel.db','domain'},{'panel.db','domain','master.key'}) or any(not x.isfile() or x.size>100_000_000 for x in t): sys.exit('备份包格式无效')
     for x in t:
         with open(os.path.join(d,x.name),'wb') as f: f.write(t.extractfile(x).read())
 PY
@@ -45,6 +46,7 @@ PY
   systemctl stop nexus-panel
   cp -p "$DATA_DIR/panel.db" "$DATA_DIR/panel.db.pre-restore" 2>/dev/null || true
   install -m 0600 -o nexus-panel -g nexus-panel "$temp/panel.db" "$DATA_DIR/panel.db"
+  if [[ -f "$temp/master.key" ]]; then install -m 0600 -o nexus-panel -g nexus-panel "$temp/master.key" "$DATA_DIR/master.key"; fi
   systemctl start nexus-panel
   echo '已恢复数据库。原节点密钥不会从散列中还原；原代理仍可用。新域名请在菜单中设置。'
 )
@@ -78,7 +80,7 @@ while :; do
     5) password_reset ;;
     6) backup ;;
     7) restore ;;
-    8) journalctl -u nexus-panel -n 60 --no-pager ;;
+    8) journalctl -u nexus-panel -n 60 --no-pager; journalctl -u nexus-agent -n 60 --no-pager 2>/dev/null || true ;;
     9) bash "$APP_DIR/scripts/install-agent.sh" ;;
     0) exit 0 ;;
     *) echo '无效选项' ;;
