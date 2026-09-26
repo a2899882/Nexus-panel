@@ -30,7 +30,15 @@ read -r -u 3 -p '初始管理员账号 [nexus_admin]: ' admin_user
 admin_user=${admin_user:-nexus_admin}
 [[ $admin_user =~ ^[A-Za-z0-9_]{3,32}$ && $admin_user != admin_user ]] || { echo '账号格式无效或为原版默认账号' >&2; exit 1; }
 read -r -s -u 3 -p '初始密码（至少 12 位，留空自动生成）: ' admin_password; echo
-if [[ -z $admin_password ]]; then admin_password=$(openssl rand -base64 24); generated=1; else generated=0; fi
+if [[ -z $admin_password ]]; then
+  if ! command -v openssl >/dev/null 2>&1; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssl
+  fi
+  admin_password=$(openssl rand -base64 24); generated=1
+else
+  generated=0
+fi
 [[ ${#admin_password} -ge 12 ]] || { echo '密码至少 12 位' >&2; exit 1; }
 
 apt-get update -qq

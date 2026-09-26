@@ -20,7 +20,7 @@ jobs:
           python3 -m py_compile scripts/*.py
       - name: Build frontend
         working-directory: vite-frontend
-        run: npm install && npm run build
+        run: npm install --legacy-peer-deps && npm run build
       - name: Build backend
         working-directory: springboot-backend
         run: mvn -B -DskipTests package
