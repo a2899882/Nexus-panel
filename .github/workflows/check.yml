@@ -1,19 +1,15 @@
 name: Build panel
 on:
   push:
+    branches: [main]
   pull_request:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
       - name: Check management scripts
         run: |
           bash -n panel_install.sh scripts/mb.sh scripts/legacy_cleanup.sh
@@ -23,19 +19,15 @@ jobs:
           docker run --rm -v "$PWD:/src:ro" -w /src \
             -e DB_NAME=ci -e DB_USER=ci -e DB_PASSWORD=ci -e JWT_SECRET=ci \
             debian:12-slim sh -ec 'apt-get update -qq && apt-get install -y -qq docker-compose >/dev/null && docker-compose -f compose.yml config >/dev/null'
-      - name: Build frontend
-        working-directory: vite-frontend
-        run: npm install --legacy-peer-deps && npm run build
-      - name: Build backend
-        working-directory: springboot-backend
-        run: mvn -B -DskipTests package
       - name: Build deployment images
         env:
           DB_NAME: ci
           DB_USER: ci
           DB_PASSWORD: ci
           JWT_SECRET: ci
-        run: docker compose -f compose.yml build backend frontend
+        run: |
+          docker compose -f compose.yml build backend
+          docker compose -f compose.yml build frontend
       - name: Smoke test running panel
         env:
           DB_NAME: ci
@@ -60,6 +52,23 @@ jobs:
           done
           docker compose -f compose.yml logs --tail=150 mysql backend frontend
           exit 1
+      - name: Publish public prebuilt images
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker save nexus-panel/backend:local nexus-panel/frontend:local | gzip -1 > panel-images.tar.gz
+          sha256sum panel-images.tar.gz > panel-images.sha256
+          tag="build-${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" panel-images.tar.gz panel-images.sha256 --clobber
+          else
+            gh release create "$tag" panel-images.tar.gz panel-images.sha256 \
+              --target "$GITHUB_SHA" --title "Nexus-panel images ${GITHUB_SHA}" \
+              --notes "Prebuilt backend and frontend images for this source commit." --latest=false
+          fi
+          curl -fsSL --retry 3 "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/panel-images.sha256" -o /tmp/panel-images-published.sha256
+          cmp panel-images.sha256 /tmp/panel-images-published.sha256
       - name: Stop smoke test containers
         if: always()
         env:

@@ -19,7 +19,7 @@ load_db_name() {
   DB_NAME=$name
 }
 domain() {
-  local new=${1:-} old='' import='import /etc/caddy/nexus-panel.caddy'
+  local new=${1:-} old='' import='import /etc/caddy/nexus-panel.caddy' added_import=0
   if [[ -z $new ]]; then read -r -p '新的面板域名（DNS 已指向本机）: ' new; fi
   [[ $new =~ ^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$ ]] || { echo '域名无效' >&2; return 1; }
   mkdir -p /etc/caddy
@@ -31,9 +31,13 @@ $new {
 }
 EOF
   touch /etc/caddy/Caddyfile
-  if ! grep -Fqx "$import" /etc/caddy/Caddyfile; then printf '\n%s\n' "$import" >> /etc/caddy/Caddyfile; fi
+  if ! grep -Fqx "$import" /etc/caddy/Caddyfile; then
+    printf '\n%s\n' "$import" >> /etc/caddy/Caddyfile
+    added_import=1
+  fi
   if ! caddy validate --config /etc/caddy/Caddyfile; then
     if [[ -n $old ]]; then printf '%s\n' "$old" > "$CADDY_SITE"; else rm -f "$CADDY_SITE"; fi
+    if [[ $added_import -eq 1 ]]; then sed -i '\@^import /etc/caddy/nexus-panel.caddy$@d' /etc/caddy/Caddyfile; fi
     echo 'Caddy 配置检查失败，已恢复原域名配置' >&2
     return 1
   fi
@@ -45,6 +49,7 @@ EOF
 }
 backup() {
   local tmp target attempt ready=0
+  [[ -s $DOMAIN_FILE ]] || { echo '面板域名尚未配置，请先运行 mb domain。' >&2; return 1; }
   compose up -d mysql >/dev/null
   for attempt in {1..30}; do
     if compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "SELECT COUNT(*) FROM user"' >/dev/null 2>&1; then
@@ -119,8 +124,30 @@ restore() {
   echo '若迁移到新服务器，请在网站配置中更新节点后端 IP，并重新下发原版节点安装命令。'
 }
 install_panel() {
-  # Build one image at a time while the application is stopped, so a 1 GB VPS
-  # does not run MySQL, Java, Maven and Node concurrently.
+  local revision tmp base
+  revision=$(git rev-parse HEAD)
+  if [[ -f runtime/image-sha && $(cat runtime/image-sha) == "$revision" ]] &&
+     docker image inspect nexus-panel/backend:local nexus-panel/frontend:local >/dev/null 2>&1; then
+    compose up -d --no-build
+    echo '当前版本镜像已就绪，面板已启动。'
+    return
+  fi
+  tmp=$(mktemp -d)
+  base="https://github.com/a2899882/Nexus-panel/releases/download/build-$revision"
+  echo '正在获取已经构建好的 Nexus-panel 镜像（首次下载受网络速度影响）...'
+  if curl -fsSL --retry 2 --connect-timeout 15 --max-time 900 "$base/panel-images.sha256" -o "$tmp/panel-images.sha256" &&
+     curl -fsSL --retry 2 --connect-timeout 15 --max-time 600 "$base/panel-images.tar.gz" -o "$tmp/panel-images.tar.gz" &&
+     (cd "$tmp" && sha256sum -c panel-images.sha256) &&
+     { compose stop frontend backend mysql >/dev/null 2>&1 || true; docker load -i "$tmp/panel-images.tar.gz"; }; then
+    rm -rf -- "$tmp"
+    printf '%s\n' "$revision" > runtime/image-sha
+    compose up -d --no-build
+    echo '已使用预构建镜像启动面板，数据库卷保持不变。'
+    return
+  fi
+  rm -rf -- "$tmp"
+  echo '该提交的预构建镜像不可用，改为在本机依次构建后端和前端。' >&2
+  # Only the source fallback runs Maven and Node on the panel server.
   compose stop frontend backend mysql >/dev/null 2>&1 || true
   if ! compose build backend || ! compose build frontend; then
     compose start mysql backend frontend || true
@@ -128,6 +155,7 @@ install_panel() {
     return 1
   fi
   compose up -d --no-build
+  printf '%s\n' "$revision" > runtime/image-sha
   echo '面板已安装/重建，数据库卷保持不变。'
 }
 reset_admin() {
@@ -148,22 +176,6 @@ reset_admin() {
   result=$(compose exec -T mysql sh -c 'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "$1"' sh "UPDATE user SET pwd='$hash' WHERE id=1 AND role_id=0; SELECT ROW_COUNT();")
   [[ $result == 1 ]] || { echo '未找到初始管理员账号，密码没有更改。' >&2; return 1; }
   echo '管理员密码已更新。'
-}
-cleanup_swap() {
-  local file=/swapfile-nexus-panel used available
-  [[ -f $file && ! -L $file ]] || { echo '未发现旧版安装器创建的 swap 文件。'; return 0; }
-  used=$(awk '$1 == "/swapfile-nexus-panel" {print $4}' /proc/swaps)
-  if [[ -n $used ]]; then
-    available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
-    if (( available < used + 131072 )); then
-      echo '可用内存不足以安全停用旧 swap。请先停止其他任务后重试。' >&2
-      return 1
-    fi
-    swapoff "$file" || { echo 'swapoff 失败，保留原文件和开机配置。' >&2; return 1; }
-  fi
-  sed -i '\@^/swapfile-nexus-panel[[:space:]]@d' /etc/fstab
-  rm -f -- "$file"
-  echo '旧版安装器创建的 swap 文件和开机配置已移除。'
 }
 start_panel() {
   compose up -d
@@ -216,10 +228,22 @@ status() {
 menu() {
   while true; do
     echo
-    echo 'Nexus-panel | SSH 菜单（mb）'
-    echo '1) 状态  2) 升级  3) 更换域名  4) 备份  5) 恢复'
-    echo '6) 日志  7) 重启  8) 停止（保留数据）  9) 启动/重装  10) 卸载'
-    echo '11) 重设管理员密码  12) 清理旧版 swap  0) 退出'
+    echo '========================================'
+    echo '       Nexus-panel 面板管理菜单'
+    echo '========================================'
+    echo ' 1. 查看状态'
+    echo ' 2. 更新面板'
+    echo ' 3. 更换面板域名'
+    echo ' 4. 导出备份'
+    echo ' 5. 恢复备份'
+    echo ' 6. 查看日志'
+    echo ' 7. 重启服务'
+    echo ' 8. 停止服务（保留数据）'
+    echo ' 9. 启动 / 重装面板'
+    echo '10. 卸载面板'
+    echo '11. 重设管理员密码'
+    echo ' 0. 退出'
+    echo '========================================'
     read -r -p '选择: ' choice
     case "$choice" in
       1) status ;;
@@ -233,7 +257,6 @@ menu() {
       9) install_panel ;;
       10) uninstall_panel; return ;;
       11) reset_admin ;;
-      12) cleanup_swap ;;
       0) return ;;
       *) echo '选项无效' ;;
     esac
@@ -252,6 +275,5 @@ case ${1:-menu} in
   stop) compose down ;;
   uninstall) uninstall_panel ;;
   reset-admin) reset_admin ;;
-  cleanup-swap) cleanup_swap ;;
-  *) echo '用法：mb [menu|domain|backup|restore|status|update|install|start|restart|stop|uninstall|reset-admin|cleanup-swap]' >&2; exit 2 ;;
+  *) echo '用法：mb [menu|domain|backup|restore|status|update|install|start|restart|stop|uninstall|reset-admin]' >&2; exit 2 ;;
 esac

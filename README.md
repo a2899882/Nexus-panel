@@ -10,7 +10,7 @@
 
 ## 安装面板
 
-支持 Debian 12 / Ubuntu 22.04+、systemd、root SSH 终端、x86_64。域名 DNS 指向服务器，开放 80/443 给 Caddy；节点到面板后端需要访问 **TCP 6365**，仅向可信节点放行。安装会从本仓库逐个构建后端和前端镜像，构建时暂停已运行的面板容器，并限制 Maven、Node 的构建内存及服务内存，以适应 1 核 1 GB 的轻量服务器；首次构建可能较慢，磁盘仍需预留约 6 GB 给 Docker 镜像。安装器不创建或调整 swap；1 GB 环境能否完成构建也取决于主机实际可用内存与其他进程负载。
+支持 Debian 12 / Ubuntu 22.04+、systemd、root SSH 终端、x86_64。域名 DNS 指向服务器，开放 80/443 给 Caddy；节点到面板后端需要访问 **TCP 6365**，仅向可信节点放行。正式安装优先下载本仓库 CI 为当前提交构建的后端与前端镜像压缩包，校验 SHA-256 后加载，服务器不必运行 Maven 与 npm。首次安装仍需下载 Docker、Caddy、MySQL 镜像等，耗时取决于服务器网络。若当前提交的预构建包尚未发布或下载失败，安装器会回退到逐个源码构建并提示原因；此路径需要更多时间与可用内存，1 核 1 GB 机器可能无法完成。建议为 Docker 镜像和临时下载预留约 6 GB 磁盘空间。安装器不创建或调整 swap。
 
 root 登录后复制下面**完整的一行**；下载成功才会执行脚本：
 
@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/panel_ins
 
 安装器依次询问面板域名、节点连接后端的公网 IP/域名、管理员账号和密码。密码留空时随机生成并只显示一次；新安装没有共享默认密码。访问 `https://面板域名` 登录，方式与 Flux 原版一致。在“网站配置”可修改应用名称及节点后端地址；账号密码可在面板内修改。
 
-如果安装在构建时中断，重新运行**同一条命令**即可识别 `/opt/nexus-panel` 中的安装配置、拉取修复并继续；数据库配置不会重新生成。安装过程中已创建 `/usr/local/bin/mb`，也可用 `mb install` 重试。此前生成的随机初始密码丢失时，安装完成后执行 `mb reset-admin` 重设。
+如果安装在下载或构建时中断，重新运行**同一条命令**即可识别 `/opt/nexus-panel` 中的安装配置、拉取修复并继续；数据库配置不会重新生成。安装过程中已创建 `/usr/local/bin/mb`，也可用 `mb install` 重试。此前生成的随机初始密码丢失时，安装完成后执行 `mb reset-admin` 重设。
 
 前端仅监听本机 `127.0.0.1:6366` 并由 Caddy 提供 HTTPS。Flux 节点协议仍要求连接独立的 `后端地址:6365`，不能把这个端口误配置成前端 HTTPS 地址，也不要给节点后端域名套 CDN。建议在云防火墙限制 6365 的来源。
 
@@ -41,11 +41,10 @@ curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/panel_ins
 | 9 | 启动或按现有源码重装服务，不删除数据（`mb install`） |
 | 10 | 先备份，确认后卸载本项目容器、数据卷、镜像、源码和域名配置（`mb uninstall`） |
 | 11 | 重设初始管理员密码（`mb reset-admin`） |
-| 12 | 移除旧安装器创建的 `/swapfile-nexus-panel` 及其开机配置（`mb cleanup-swap`） |
 
 备份包含 MySQL 数据、安装时的 `.env` 配置快照与域名记录。`mb uninstall` 在移除新版数据前生成这类备份；保留 Docker、Caddy 及主机 swap，以免影响其他服务，卸载后可再次运行上方 root 一行命令。恢复时使用**当前机器**的域名和数据库凭证，避免新服务器 MySQL 卷与旧密码不匹配；SQL 导入失败时尝试回滚到操作前的备份。新服务器迁移：先在新服务器按上面的命令安装，将压缩包上传到 `/root`，运行 `mb` 选 5，填入完整路径；随后在面板“网站配置”更新节点后端地址并重新安装/指向现有节点。
 
-若旧安装器此前创建了 3 GB 的 `/swapfile-nexus-panel`，新版安装器不会重复创建。安装完成后可运行 `mb cleanup-swap`：仅在有足够可用内存时先停用该文件，再删除对应的 `/etc/fstab` 条目和文件；不会碰其他 swap。停用失败则保持原文件和开机配置，以便稍后重试。
+若旧安装器此前创建了 `/swapfile-nexus-panel`，新版安装器不会重复创建或调整它；`mb` 菜单不管理系统 swap。
 
 ## 与旧 Nexus-panel 的关系
 
@@ -56,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/panel_ins
 - `vite-frontend/`：Flux 原版 React/Vite 前端，品牌改为 Nexus-panel。
 - `springboot-backend/`：Flux 原版 Spring Boot API。
 - `gost.sql`：数据库模板；安装时生成带随机初始凭证的 `runtime/init.sql`。
-- `compose.yml`：构建源码镜像，运行 MySQL、后端与前端。
+- `compose.yml`：运行 MySQL、后端与前端；优先加载与当前源码提交对应的预构建镜像，必要时逐个构建源码镜像。
 - `panel_install.sh`、`scripts/mb.sh`、`scripts/legacy_cleanup.sh`：面板部署、旧版备份迁移、SSH 菜单、域名、备份与恢复。
 
 ```bash
