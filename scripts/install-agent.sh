@@ -19,8 +19,8 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 curl ca-certificates openssl
 arch=$(uname -m)
 case "$arch" in
-  x86_64) asset='realm-x86_64-unknown-linux-gnu.tar.gz' ;;
-  aarch64) asset='realm-aarch64-unknown-linux-gnu.tar.gz' ;;
+  x86_64) asset='realm-x86_64-unknown-linux-gnu-glibc2.28.tar.gz' ;;
+  aarch64) asset='realm-aarch64-unknown-linux-gnu-glibc2.28.tar.gz' ;;
   *) echo '当前支持 x86_64 / aarch64'; exit 1 ;;
 esac
 version='v2.9.6'
@@ -38,6 +38,12 @@ if not match or not match.get('digest','').startswith('sha256:'): sys.exit('无�
 if hashlib.sha256(open(path,'rb').read()).hexdigest()!=match['digest'][7:]: sys.exit('Realm SHA-256 校验失败')
 PY
 tar --no-same-owner -xzf "$tmp/realm.tar.gz" -C "$tmp" realm
+chmod 0755 "$tmp/realm"
+if ! "$tmp/realm" --version > "$tmp/realm-version.log" 2>&1; then
+  cat "$tmp/realm-version.log" >&2
+  echo 'Realm 与本机系统不兼容，安装未修改现有节点凭证或服务。' >&2
+  exit 1
+fi
 curl -fL --retry 3 'https://raw.githubusercontent.com/a2899882/Nexus-panel/main/agent.py' -o "$tmp/agent.py"
 curl -fL --retry 3 'https://raw.githubusercontent.com/a2899882/Nexus-panel/main/tunnel.py' -o "$tmp/tunnel.py"
 agent_token=$(python3 - "$panel_url" "$ticket" <<'PY'

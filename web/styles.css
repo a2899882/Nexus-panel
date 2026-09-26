@@ -8,3 +8,4 @@ input,select,textarea{min-height:40px;width:100%;padding:9px 11px;border:1px sol
 .metric:nth-child(1){--accent:#4f6ef7}.metric:nth-child(2){--accent:#159f70}.metric:nth-child(3){--accent:#d84d61}.metric:nth-child(4){--accent:#bc7a12}.check-input{width:auto;min-height:auto;margin:0 6px 0 0}
 
 textarea{resize:vertical;line-height:1.5}
+.data-table td .error-detail{white-space:normal;max-width:380px;line-height:1.45;color:var(--danger);overflow-wrap:anywhere}.path-cell span{color:var(--muted);padding:0 8px}.data-table td.path-cell{white-space:normal;min-width:240px}

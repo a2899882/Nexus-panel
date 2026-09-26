@@ -122,4 +122,49 @@ class PanelTest(unittest.TestCase):
         self.call('/accounts/'+str(account['id']),'DELETE',expect=409)
         self.call('/tunnels/'+str(route['id']),'DELETE')
         self.call('/accounts/'+str(account['id']),'DELETE')
+    def test_chain_tunnel_multiple_forwards_and_shared_account(self):
+        self.login()
+        nodes=[]
+        for label in ('front','middle','exit'):
+            made=self.call('/nodes','POST',{'name':label,'address':'127.0.0.1'},expect=201)
+            nodes.append((made['id'],self.enroll(made)))
+        aid=self.call('/accounts','POST',{'name':'team','quota_gb':1,'speed_mbps':10,'billing':'both','ratio':1,'enabled':True},expect=201)['id']
+        tid=self.call('/tunnels','POST',{'name':'CNIX path','mode':'chain','account_id':aid,'entry_id':nodes[0][0],'relay_id':nodes[1][0],'exit_id':nodes[2][0],'enabled':True},expect=201)['id']
+        first=self.call('/forwardings','POST',{'name':'SSH','tunnel_id':tid,'entry_port':'','targets':'example.com:22','strategy':'first','enabled':True},expect=201)
+        second=self.call('/forwardings','POST',{'name':'Web','tunnel_id':tid,'entry_port':'','targets':'example.com:443\nbackup.example.com:443','strategy':'roundrobin','enabled':True},expect=201)
+        self.assertNotEqual(first['entry_port'],second['entry_port'])
+        self.call('/forwardings','POST',{'name':'conflict','tunnel_id':tid,'entry_port':first['entry_port'],'targets':'example.com:80'},expect=409)
+        self.call('/tunnels/'+str(tid),'DELETE',expect=409)
+        def poll(index,payload=None):
+            return self.call('/agent/poll','POST',{'cert_fp':str(index+1)*64,**(payload or {})},headers={'Authorization':'Bearer '+nodes[index][1]})
+        for index in range(3): poll(index)
+        entry=poll(0)['tunnels'];exit_routes=poll(2)['tunnels']
+        self.assertEqual({r['id'] for r in entry},{-first['id'],-second['id']})
+        self.assertEqual(len(exit_routes[1]['targets']),2)
+        self.assertEqual({r['account_id'] for r in entry},{aid})
+        poll(0,{'usage':[{'route_id':-first['id'],'epoch':'c'*32,'up':512,'down':256,'billed':768},
+                          {'route_id':-second['id'],'epoch':'d'*32,'up':100,'down':50,'billed':150}]})
+        poll(0,{'usage':[{'route_id':-first['id'],'epoch':'c'*32,'up':512,'down':256,'billed':768}]})
+        account=self.call('/dashboard')['accounts'][0]
+        self.assertEqual(account['used_bytes'],918)
+        self.call('/forwardings/'+str(first['id']),'DELETE')
+        self.call('/forwardings/'+str(second['id']),'DELETE')
+        self.call('/tunnels/'+str(tid),'DELETE')
+    def test_auto_account_and_legacy_migration(self):
+        self.login()
+        ids=[self.call('/nodes','POST',{'name':name,'address':'127.0.0.1'},expect=201)['id'] for name in ('entry','relay','exit')]
+        base={'name':'simple','mode':'chain','entry_id':ids[0],'relay_id':ids[1],'exit_id':ids[2],'enabled':True}
+        self.call('/tunnels','POST',{**base,'exit_id':ids[0]},expect=400)
+        self.assertEqual(self.call('/dashboard')['accounts'],[])
+        tid=self.call('/tunnels','POST',base,expect=201)['id']
+        dashboard=self.call('/dashboard')
+        self.assertEqual(len(dashboard['accounts']),1)
+        self.assertEqual(dashboard['tunnels'][0]['account_id'],dashboard['accounts'][0]['id'])
+        self.call('/tunnels/'+str(tid),'DELETE')
+        legacy={**base,'mode':'legacy','account_id':dashboard['accounts'][0]['id'],'entry_port':35550,'relay_port':35551,'exit_port':35552,'target_host':'example.com','target_port':443}
+        old_id=self.call('/tunnels','POST',legacy,expect=201)['id']
+        self.call('/tunnels/'+str(old_id),'PUT',{**base,'account_id':legacy['account_id']})
+        migrated=self.call('/dashboard')['forwardings'][0]
+        self.assertEqual((migrated['entry_port'],migrated['targets']),(35550,['example.com:443']))
+        self.call('/tunnels/'+str(old_id),'PUT',legacy,expect=409)
 if __name__=='__main__': unittest.main()

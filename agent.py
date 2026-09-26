@@ -41,6 +41,7 @@ class Agent:
         self.rejected_hash=''; self.last_reject_at=0; self.error=''; self.interval=interval; self.running=True
         self.log_tail=collections.deque(maxlen=25)
         self.tunnel_config=self.dir/'tunnels.json'; self.tunnel_proc=None; self.tunnel_hash=''
+        self.tunnel_log_tail=collections.deque(maxlen=20)
         self.cert=self.dir/'tunnel.crt'; self.key=self.dir/'tunnel.key'
         if not self.cert.exists() or not self.key.exists():
             subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','3650',
@@ -82,12 +83,22 @@ class Agent:
             self.tunnel_proc=None
     def start_tunnel(self):
         if not self.tunnel_config.exists() or not json.loads(self.tunnel_config.read_text()): return
+        self.tunnel_log_tail.clear()
         self.tunnel_proc=subprocess.Popen([sys.executable,str(Path(__file__).with_name('tunnel.py')),
             '--config',str(self.tunnel_config),'--cert',str(self.cert),'--key',str(self.key),
-            '--usage',str(self.dir/'usage.db')],stdout=sys.stderr,stderr=sys.stderr)
+            '--usage',str(self.dir/'usage.db')],stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+        proc=self.tunnel_proc
+        def drain():
+            for line in proc.stdout:
+                message=line.decode(errors='replace').strip()
+                self.tunnel_log_tail.append(message)
+                print('tunnel:',message,file=sys.stderr,flush=True)
+            proc.stdout.close()
+        threading.Thread(target=drain,daemon=True).start()
         time.sleep(.5)
         if self.tunnel_proc.poll() is not None:
-            self.tunnel_proc=None; raise RuntimeError('隧道启动失败；请查看 journalctl -u nexus-agent')
+            self.tunnel_proc=None
+            raise RuntimeError('隧道启动失败：'+(' '.join(self.tunnel_log_tail)[-185:] or '请查看 journalctl -u nexus-agent'))
     def usage(self):
         path=self.dir/'usage.db'
         if not path.exists(): return []

@@ -38,17 +38,51 @@ class TunnelTest(unittest.TestCase):
         der=subprocess.check_output(['openssl','x509','-in',str(cert),'-outform','DER'])
         return cert,key,hashlib.sha256(der).hexdigest()
     def launch(self,name,route,cert,key):
-        config=self.path/(name+'.json');config.write_text(json.dumps([route]))
+        routes=route if isinstance(route,list) else [route]
+        config=self.path/(name+'.json');config.write_text(json.dumps(routes))
         proc=subprocess.Popen([sys.executable,str(ROOT/'tunnel.py'),'--config',str(config),
             '--cert',str(cert),'--key',str(key),'--usage',str(self.path/(name+'.db'))],
             stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
         self.processes.append(proc)
-        port=int(route['listen'].rsplit(':',1)[1])
-        for _ in range(100):
-            try:
-                with socket.create_connection(('127.0.0.1',port),timeout=.1): return
-            except OSError: time.sleep(.02)
-        self.fail(f'{name} did not listen, exit code {proc.poll()}')
+        for route in routes:
+            port=int(route['listen'].rsplit(':',1)[1])
+            for _ in range(100):
+                try:
+                    with socket.create_connection(('127.0.0.1',port),timeout=.1): break
+                except OSError: time.sleep(.02)
+            else: self.fail(f'{name} did not listen on {port}, exit code {proc.poll()}')
+    def test_two_real_three_hop_forwards_share_account(self):
+        targets=[]
+        for prefix in (b'A',b'B'):
+            server=socket.socket();server.bind(('127.0.0.1',0));server.listen();self.addCleanup(server.close)
+            def echo(listener,marker):
+                while True:
+                    try: client,_=listener.accept()
+                    except OSError: return
+                    with client:
+                        while data:=client.recv(4096): client.sendall(marker+data)
+            threading.Thread(target=echo,args=(server,prefix),daemon=True).start()
+            targets.append(server.getsockname()[1])
+        ports=[[free_port() for _ in range(3)] for _ in range(2)]
+        certs=[self.cert(x) for x in ('entry','relay','exit')]
+        entry=[];relay=[];exit_routes=[]
+        for i in range(2):
+            rid=-(i+1);base={'id':rid,'secret':('a' if i==0 else 'b')*64}
+            entry.append(dict(base,role='entry',listen=f'127.0.0.1:{ports[i][0]}',next_host='127.0.0.1',next_port=ports[i][1],next_fp=certs[1][2],account_id=8,quota_bytes=100,speed_bps=0,billing='both',ratio_bp=10000,used_bytes=0))
+            relay.append(dict(base,role='relay',listen=f'127.0.0.1:{ports[i][1]}',next_host='127.0.0.1',next_port=ports[i][2],next_fp=certs[2][2]))
+            exit_routes.append(dict(base,role='exit',listen=f'127.0.0.1:{ports[i][2]}',targets=[{'host':'127.0.0.1','port':targets[i]}],strategy='first'))
+        self.launch('exit',exit_routes,*certs[2][:2])
+        self.launch('relay',relay,*certs[1][:2])
+        self.launch('entry',entry,*certs[0][:2])
+        for i,prefix in enumerate((b'A',b'B')):
+            with socket.create_connection(('127.0.0.1',ports[i][0]),timeout=4) as conn:
+                conn.settimeout(4);conn.sendall(b'ping');self.assertEqual(conn.recv(5),prefix+b'ping')
+        with sqlite3_connect(self.path/'entry.db') as db:
+            for _ in range(50):
+                rows=db.execute('SELECT route_id,up,down,billed FROM usage ORDER BY route_id').fetchall()
+                if len(rows)==2 and all(row[3]>=9 for row in rows): break
+                time.sleep(.02)
+        self.assertEqual(rows,[(-2,4,5,9),(-1,4,5,9)])
     def test_real_three_hop_tls_tcp_and_accounting(self):
         echo=socket.socket();echo.bind(('127.0.0.1',0));echo.listen();self.addCleanup(echo.close)
         def server():
@@ -96,6 +130,16 @@ class TunnelTest(unittest.TestCase):
         reopened=tunnel.Meter(self.path/'usage.db',[dict(config,used_bytes=5)])
         self.assertEqual(reopened.snapshot(),snapshot)
         self.assertEqual(reopened.charge(3,'up',1),0)
+        reopened.db.close()
+    def test_shared_quota_for_two_forwards(self):
+        base=dict(role='entry',account_id=9,quota_bytes=10,speed_bps=0,billing='both',ratio_bp=10000,used_bytes=0)
+        meter=tunnel.Meter(self.path/'shared.db',[dict(base,id=-1),dict(base,id=-2)])
+        self.assertEqual(meter.charge(-1,'up',7),7)
+        self.assertEqual(meter.charge(-2,'up',7),3)
+        self.assertEqual(meter.charge(-1,'up',1),0)
+        meter.db.close()
+        reopened=tunnel.Meter(self.path/'shared.db',[dict(base,id=-1,used_bytes=10),dict(base,id=-2,used_bytes=10)])
+        self.assertEqual(reopened.charge(-2,'down',1),0)
         reopened.db.close()
 
 def sqlite3_connect(path):

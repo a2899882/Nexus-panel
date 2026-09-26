@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import hmac
+import itertools
 import json
 import os
 import socket
@@ -14,6 +15,8 @@ import uuid
 from pathlib import Path
 
 MAX_HELLO=512
+ROUND_ROBIN={}
+ROUND_LOCK=threading.Lock()
 
 def pinned_connection(host,port,fingerprint):
     raw=socket.create_connection((host,port),timeout=8)
@@ -41,7 +44,12 @@ def recv_line(conn):
     raise OSError('handshake too large')
 
 def dial(route):
-    if route['role']=='exit': return socket.create_connection((route['target_host'],route['target_port']),timeout=8)
+    if route['role']=='exit':
+        targets=route.get('targets') or [{'host':route['target_host'],'port':route['target_port']}]
+        with ROUND_LOCK:
+            index=next(ROUND_ROBIN.setdefault(route['id'],itertools.count())) if route.get('strategy')=='roundrobin' else 0
+        target=targets[index%len(targets)]
+        return socket.create_connection((target['host'],target['port']),timeout=8)
     conn=pinned_connection(route['next_host'],route['next_port'],route['next_fp'])
     try:
         conn.sendall(json.dumps({'id':route['id'],'secret':route['secret']}).encode()+b'\n')
@@ -57,44 +65,50 @@ class Meter:
         self.db=sqlite3.connect(self.path,check_same_thread=False,timeout=10)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('CREATE TABLE IF NOT EXISTS usage (route_id INTEGER PRIMARY KEY, epoch TEXT NOT NULL, up INTEGER NOT NULL, down INTEGER NOT NULL, billed INTEGER NOT NULL)')
-        self.state={}
+        self.state={}; self.groups={}
         for rid,route in self.routes.items():
             row=self.db.execute('SELECT epoch,up,down,billed FROM usage WHERE route_id=?',(rid,)).fetchone()
             if row is None:
                 row=(uuid.uuid4().hex,0,0,0)
                 with self.db: self.db.execute('INSERT INTO usage VALUES(?,?,?,?,?)',(rid,*row))
-            # The controller's total includes the reported part of this local epoch.
-            baseline=max(0,int(route['used_bytes'])-row[3])
+            aid=int(route.get('account_id',rid))
             self.state[rid]={'epoch':row[0],'up':row[1],'down':row[2],'billed':row[3],
-                             'baseline':baseline,'tokens':0.0,'last':time.monotonic()}
+                             'account_id':aid}
+            group=self.groups.setdefault(aid,{'billed':0,'baseline':0,'tokens':0.0,'last':time.monotonic()})
+            group['billed']+=row[3]
+        for rid,route in self.routes.items():
+            group=self.groups[self.state[rid]['account_id']]
+            group['baseline']=max(group['baseline'],int(route['used_bytes'])-group['billed'],0)
     def charge(self,rid,direction,count):
         if not count: return 0
         route=self.routes[rid]
         with self.lock:
             state=self.state[rid]
+            group=self.groups[state['account_id']]
             speed=int(route['speed_bps'])
             if speed:
                 while True:
                     instant=time.monotonic()
-                    state['tokens']=min(max(speed,16384),state['tokens']+(instant-state['last'])*speed)
-                    state['last']=instant
-                    if state['tokens']>=1: break
+                    group['tokens']=min(max(speed,16384),group['tokens']+(instant-group['last'])*speed)
+                    group['last']=instant
+                    if group['tokens']>=1: break
                     time.sleep(min(.05,1/speed))
-                count=min(count,max(1,int(state['tokens'])))
+                count=min(count,max(1,int(group['tokens'])))
             factor=int(route['ratio_bp']) if route['billing'] in (direction,'both') else 0
             quota=int(route['quota_bytes'])
             if quota and factor:
-                remain=quota-state['baseline']-state['billed']
+                remain=quota-group['baseline']-group['billed']
                 if remain<=0: return 0
                 count=min(count,max(1,(remain*10000)//factor))
                 # Recheck after rounding, including fractional bytes.
                 while count>0 and ((state[direction]+count)*factor//10000-state[direction]*factor//10000)>remain: count-=1
                 if not count: return 0
-            if speed: state['tokens']-=count
+            if speed: group['tokens']-=count
             old=state[direction]; state[direction]+=count
             # Billing uses cumulative directional totals, avoiding per-chunk rounding loss.
             increment=((state[direction]*factor)//10000)-((old*factor)//10000)
             state['billed']+=increment
+            group['billed']+=increment
             with self.db:
                 self.db.execute('UPDATE usage SET up=?,down=?,billed=? WHERE route_id=?',
                                 (state['up'],state['down'],state['billed'],rid))
