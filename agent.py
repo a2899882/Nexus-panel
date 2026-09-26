@@ -19,8 +19,13 @@ def realm_config(rules):
     for r in rules:
         protocol=r['protocol']
         if protocol not in ('tcp','udp','both'): raise ValueError('invalid protocol')
-        endpoints.append({'listen':r['listen'],'remote':r['remote'],
-                          'network':{'no_tcp':protocol=='udp','use_udp':protocol!='tcp'}})
+        endpoint={'listen':r['listen'],'remote':r['remote'],
+                  'network':{'no_tcp':protocol=='udp','use_udp':protocol!='tcp'}}
+        extras=r.get('extra_remotes') or []
+        if extras:
+            endpoint['extra_remotes']=extras
+            endpoint['balance']=r['balance']+': '+', '.join(['1']*(len(extras)+1))
+        endpoints.append(endpoint)
     return {'log':{'level':'warn','output':'stdout'},'endpoints':endpoints}
 
 class Agent:

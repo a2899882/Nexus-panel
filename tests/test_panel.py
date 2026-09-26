@@ -75,4 +75,16 @@ class PanelTest(unittest.TestCase):
     def test_udp_endpoint(self):
         conf=agent.realm_config([{'listen':'0.0.0.0:30001','remote':'example.com:80','protocol':'udp'}])
         self.assertEqual(conf['endpoints'][0]['network'],{'no_tcp':True,'use_udp':True})
+    def test_balanced_rule_validation_and_config(self):
+        self.login()
+        node=self.call('/nodes','POST',{'name':'relay'},expect=201)
+        r={'node_id':node['id'],'name':'two exits','listen_host':'127.0.0.1','listen_port':39490,
+           'remote_host':'127.0.0.1','remote_port':39491,'protocol':'tcp','enabled':True,
+           'extra_remotes':'127.0.0.1:39492','balance':'off'}
+        self.call('/rules','POST',r,expect=400)
+        self.call('/rules','POST',{**r,'balance':'roundrobin'},expect=201)
+        poll=self.call('/agent/poll','POST',{},headers={'Authorization':'Bearer '+node['token']})
+        endpoint=agent.realm_config(poll['rules'])['endpoints'][0]
+        self.assertEqual(endpoint['extra_remotes'],['127.0.0.1:39492'])
+        self.assertEqual(endpoint['balance'],'roundrobin: 1, 1')
 if __name__=='__main__': unittest.main()

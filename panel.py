@@ -53,12 +53,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', grp TEXT NOT NULL DEFAULT '', token_hash TEXT UNIQUE NOT NULL, last_seen INTEGER NOT NULL DEFAULT 0, version TEXT NOT NULL DEFAULT '', applied_revision INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', realm_running INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, name TEXT NOT NULL, grp TEXT NOT NULL DEFAULT '', listen_host TEXT NOT NULL DEFAULT '0.0.0.0', listen_port INTEGER NOT NULL, remote_host TEXT NOT NULL, remote_port INTEGER NOT NULL, protocol TEXT NOT NULL CHECK(protocol IN ('tcp','udp','both')), enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE, name TEXT NOT NULL, grp TEXT NOT NULL DEFAULT '', listen_host TEXT NOT NULL DEFAULT '0.0.0.0', listen_port INTEGER NOT NULL, remote_host TEXT NOT NULL, remote_port INTEGER NOT NULL, protocol TEXT NOT NULL CHECK(protocol IN ('tcp','udp','both')), extra_remotes TEXT NOT NULL DEFAULT '[]', balance TEXT NOT NULL DEFAULT 'off', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_rules_node ON rules(node_id);
         CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at);
         ''')
+        columns={r['name'] for r in c.execute('PRAGMA table_info(rules)')}
+        if 'extra_remotes' not in columns: c.execute("ALTER TABLE rules ADD COLUMN extra_remotes TEXT NOT NULL DEFAULT '[]'")
+        if 'balance' not in columns: c.execute("ALTER TABLE rules ADD COLUMN balance TEXT NOT NULL DEFAULT 'off'")
         c.execute("INSERT OR IGNORE INTO settings VALUES ('revision','1')")
         c.execute("INSERT OR IGNORE INTO settings VALUES ('retention_days','30')")
         c.execute('DELETE FROM sessions WHERE expires<?', (now(),))
@@ -93,6 +96,15 @@ def valid_host(value, *, bind=False):
         return value
     fail('地址格式无效；监听地址必须是 IP，目标可用 IP 或域名')
 def addr(host, p): return f'[{host}]:{p}' if ':' in host else f'{host}:{p}'
+def parse_remote(value):
+    if not isinstance(value,str) or len(value)>280: fail('附加目标格式无效')
+    try:
+        parsed=urllib.parse.urlsplit('tcp://'+value.strip())
+        host=valid_host(parsed.hostname or '')
+        p=parsed.port
+        if not p or parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password: raise ValueError()
+        return addr(host,p)
+    except (ValueError,APIError): fail('附加目标需为 域名:端口 或 [IPv6]:端口')
 
 def rule_data(data):
     name = required_string(data,'name',80)
@@ -104,7 +116,15 @@ def rule_data(data):
     if not isinstance(enabled, bool): fail('enabled 必须是布尔值')
     grp = str(data.get('grp') or '').strip()
     if len(grp)>60: fail('分组过长')
-    return dict(name=name, grp=grp, listen_host=listen_host, listen_port=port(data,'listen_port'), remote_host=remote_host, remote_port=port(data,'remote_port'), protocol=protocol, enabled=int(enabled))
+    extras=data.get('extra_remotes') or []
+    if isinstance(extras,str): extras=[x.strip() for x in extras.replace(',','\n').splitlines() if x.strip()]
+    if not isinstance(extras,list) or len(extras)>8: fail('附加目标最多 8 个')
+    extras=[parse_remote(x) for x in extras]
+    if len(set(extras))!=len(extras) or addr(remote_host,port(data,'remote_port')) in extras: fail('目标地址重复')
+    balance=data.get('balance') or 'off'
+    if balance not in ('off','roundrobin','iphash') or (extras and balance=='off') or (not extras and balance!='off'):
+        fail('多个目标须选择轮询或 IP 哈希策略')
+    return dict(name=name, grp=grp, listen_host=listen_host, listen_port=port(data,'listen_port'), remote_host=remote_host, remote_port=port(data,'remote_port'), protocol=protocol, extra_remotes=json.dumps(extras), balance=balance, enabled=int(enabled))
 def conflict(c, node_id, r, ignore=0):
     # Overlapping TCP/UDP modes on a node cannot bind the same port and address.
     rows = c.execute('SELECT * FROM rules WHERE node_id=? AND id!=?',(node_id,ignore)).fetchall()
@@ -116,7 +136,8 @@ def conflict(c, node_id, r, ignore=0):
 
 def clean_node(row):
     return {k:row[k] for k in ('id','name','address','grp','last_seen','version','applied_revision','error','realm_running')}
-def clean_rule(row): return dict(row)
+def clean_rule(row):
+    result=dict(row); result['extra_remotes']=json.loads(result['extra_remotes']); return result
 def cleanup(c):
     days = int(c.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()[0])
     c.execute('DELETE FROM events WHERE created_at<?',(now()-days*86400,))
@@ -186,7 +207,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 node=self.agent_auth(c)
                 if path=='/api/agent/poll' and method=='POST':
                     rules=c.execute('SELECT * FROM rules WHERE node_id=? AND enabled=1 ORDER BY id',(node['id'],)).fetchall()
-                    desired=[{'id':r['id'],'listen':addr(r['listen_host'],r['listen_port']),'remote':addr(r['remote_host'],r['remote_port']),'protocol':r['protocol']} for r in rules]
+                    desired=[{'id':r['id'],'listen':addr(r['listen_host'],r['listen_port']),'remote':addr(r['remote_host'],r['remote_port']),'protocol':r['protocol'],'extra_remotes':json.loads(r['extra_remotes']),'balance':r['balance']} for r in rules]
                     c.execute('UPDATE nodes SET last_seen=?,version=?,applied_revision=?,error=?,realm_running=? WHERE id=?', (now(),str(data.get('version',''))[:32],int(data.get('applied_revision') or 0),str(data.get('error',''))[:240],int(bool(data.get('realm_running'))),node['id']))
                     return self.reply({'revision':revision(c),'rules':desired})
                 fail('未找到',404)
@@ -254,7 +275,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 nid=data.get('node_id')
                 if isinstance(nid,bool) or not str(nid).isdigit() or not c.execute('SELECT 1 FROM nodes WHERE id=?',(int(nid),)).fetchone(): fail('请选择服务器')
                 r=rule_data(data); conflict(c,int(nid),r)
-                cur=c.execute('INSERT INTO rules(node_id,name,grp,listen_host,listen_port,remote_host,remote_port,protocol,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(int(nid),*r.values(),now()))
+                cur=c.execute('INSERT INTO rules(node_id,name,grp,listen_host,listen_port,remote_host,remote_port,protocol,extra_remotes,balance,enabled,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(int(nid),*r.values(),now()))
                 bump(c); event(c,user['username'],'添加规则',r['name'])
                 return self.reply({'id':cur.lastrowid},201)
             if path.startswith('/api/rules/'):
@@ -264,7 +285,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not old: fail('规则不存在',404)
                 if method=='PUT':
                     r=rule_data(data); conflict(c,old['node_id'],r,rid)
-                    c.execute('UPDATE rules SET name=?,grp=?,listen_host=?,listen_port=?,remote_host=?,remote_port=?,protocol=?,enabled=? WHERE id=?',(*r.values(),rid))
+                    c.execute('UPDATE rules SET name=?,grp=?,listen_host=?,listen_port=?,remote_host=?,remote_port=?,protocol=?,extra_remotes=?,balance=?,enabled=? WHERE id=?',(*r.values(),rid))
                     bump(c); event(c,user['username'],'编辑规则',r['name']); return self.reply({'ok':True})
                 if method=='DELETE':
                     c.execute('DELETE FROM rules WHERE id=?',(rid,)); bump(c)
