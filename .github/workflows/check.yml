@@ -1,0 +1,16 @@
+name: check
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s tests -v
+      - run: python3 -m py_compile panel.py agent.py
+      - run: bash -n scripts/*.sh
+      - run: node --check web/app.js
