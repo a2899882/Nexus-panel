@@ -21,4 +21,7 @@ data = data.replace('__NEXUS_BACKEND_ADDRESS__', backend)
 if '__NEXUS_' in data:
     raise SystemExit('初始化模板尚有未替换字段')
 destination.write_text(data)
-destination.chmod(0o600)
+# The seed contains password hashes but no plaintext secrets. The host runtime
+# directory is root-only; MySQL's unprivileged container user must read the
+# bind-mounted file during first initialization.
+destination.chmod(0o644)

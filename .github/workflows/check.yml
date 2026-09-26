@@ -38,7 +38,7 @@ jobs:
           DB_PASSWORD: ci
           JWT_SECRET: ci
         run: |
-          mkdir -p runtime
+          install -d -m 0700 runtime
           NEXUS_ADMIN_USER=ci_admin NEXUS_ADMIN_PASSWORD=CI-Only-Test-Password-1234 NEXUS_BACKEND_ADDRESS=127.0.0.1:6365 \
             python3 scripts/render_sql.py gost.sql runtime/init.sql
           docker compose -f compose.yml up -d --no-build
