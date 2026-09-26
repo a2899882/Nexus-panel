@@ -1,16 +1,26 @@
-name: check
+name: Build panel
 on:
   push:
   pull_request:
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: '3.12'
-      - run: python3 -m unittest discover -s tests -v
-      - run: python3 -m py_compile panel.py agent.py
-      - run: bash -n scripts/*.sh
-      - run: node --check web/app.js
+          node-version: '20'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Check management scripts
+        run: |
+          bash -n panel_install.sh scripts/mb.sh
+          python3 -m py_compile scripts/*.py
+      - name: Build frontend
+        working-directory: vite-frontend
+        run: npm install && npm run build
+      - name: Build backend
+        working-directory: springboot-backend
+        run: mvn -B -DskipTests package

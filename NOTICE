@@ -1,0 +1,12 @@
+Nexus-panel is derived from flux-panel by bqlpfy:
+https://github.com/bqlpfy/flux-panel
+Source baseline: main, commit 9b5ccdb (2026-09-26 checkout).
+
+The Flux panel frontend, Spring Boot backend and SQL schema remain under
+the Apache License 2.0. The copyright and license notices in those sources
+and the root LICENSE are retained. Nexus-panel changes include branding,
+source builds, the panel installer, domain configuration and SSH menu.
+
+The node-side GOST implementation is not included or modified here.
+The original bundled SIMSUN.TTC font is replaced at build time with the
+distribution's Noto CJK font for the existing CAPTCHA feature.
