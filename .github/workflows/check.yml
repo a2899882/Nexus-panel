@@ -16,7 +16,7 @@ jobs:
           java-version: '21'
       - name: Check management scripts
         run: |
-          bash -n panel_install.sh scripts/mb.sh
+          bash -n panel_install.sh scripts/mb.sh scripts/legacy_cleanup.sh
           python3 -m py_compile scripts/*.py
       - name: Build frontend
         working-directory: vite-frontend

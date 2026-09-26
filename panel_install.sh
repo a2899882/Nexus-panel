@@ -9,16 +9,25 @@ if [[ $EUID -ne 0 ]]; then echo '请使用 root 执行安装脚本' >&2; exit 1;
 if [[ ! -r /dev/tty ]]; then echo '安装需要交互式 SSH 终端' >&2; exit 1; fi
 exec 3</dev/tty
 if ! command -v apt-get >/dev/null; then echo '当前支持 Debian/Ubuntu + systemd' >&2; exit 1; fi
-if [[ -d $APP_DIR && -n $(ls -A "$APP_DIR") ]]; then
-  echo "检测到现有安装：$APP_DIR。请先备份旧项目；旧 SQLite 数据与 Flux 的 MySQL 数据不兼容，本安装器不会覆盖。" >&2
+if [[ -f "$APP_DIR/compose.yml" && -f "$APP_DIR/.env" ]]; then
+  echo '检测到新版面板，请执行 mb install 以重建服务，或执行 mb update 升级。' >&2
   exit 1
 fi
-if [[ -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain ]]; then
-  echo '发现旧版 Nexus-panel 的域名配置。请先备份旧安装并移除旧 Caddy 站点，再运行安装脚本。' >&2
-  exit 1
+if [[ -e $APP_DIR || -L $APP_DIR || -e /var/lib/nexus-panel || -f /etc/systemd/system/nexus-panel.service ||
+      -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain || -L /usr/local/bin/nexus-panel ]]; then
+  if ! command -v curl >/dev/null; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates
+  fi
+  curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/scripts/legacy_cleanup.sh \
+    -o /root/nexus-panel-legacy-cleanup.sh
+  bash /root/nexus-panel-legacy-cleanup.sh
+  rm -f /root/nexus-panel-legacy-cleanup.sh
 fi
-if systemctl is-active --quiet nexus-panel 2>/dev/null; then
-  echo '检测到旧 Nexus-panel 服务正在运行。请先备份并停止旧服务，再安装新版。' >&2
+if [[ -d $APP_DIR && -n $(ls -A "$APP_DIR") ]] ||
+   [[ -f /etc/caddy/nexus-panel.caddy || -f /etc/nexus-panel-domain ]] ||
+   systemctl is-active --quiet nexus-panel 2>/dev/null; then
+  echo '检测到尚未清理的旧面板或其他安装，已停止，未覆盖任何数据。' >&2
   exit 1
 fi
 

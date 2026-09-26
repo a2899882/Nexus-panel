@@ -44,9 +44,18 @@ EOF
   echo "面板域名：https://$new"
 }
 backup() {
-  local tmp target
+  local tmp target attempt ready=0
+  compose up -d mysql >/dev/null
+  for attempt in {1..30}; do
+    if compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -N -e "SELECT COUNT(*) FROM user"' >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 2
+  done
+  [[ $ready -eq 1 ]] || { echo '数据库尚未就绪或缺少管理员表，未生成备份。' >&2; return 1; }
   tmp=$(mktemp -d)
-  target="/root/nexus-panel-backup-$(date +%Y%m%d-%H%M%S)-$$.tar.gz"
+  target="/root/nexus-panel-backup-$(date +%Y%m%d-%H%M%S)-$.tar.gz"
   if ! compose exec -T mysql sh -c 'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction --routines --events --default-character-set=utf8mb4 "$MYSQL_DATABASE"' > "$tmp/panel.sql"; then
     rm -f "$tmp/panel.sql"
     rmdir "$tmp"
@@ -57,7 +66,13 @@ backup() {
   cp "$DOMAIN_FILE" "$tmp/domain.txt"
   printf '%s\n' NEXUS_PANEL_BACKUP_V1 > "$tmp/manifest.txt"
   umask 077
-  tar -czf "$target" -C "$tmp" panel.sql env.snapshot domain.txt manifest.txt
+  if ! tar -czf "$target" -C "$tmp" panel.sql env.snapshot domain.txt manifest.txt ||
+     ! tar -tzf "$target" >/dev/null; then
+    rm -f "$target" "$tmp/panel.sql" "$tmp/env.snapshot" "$tmp/domain.txt" "$tmp/manifest.txt"
+    rmdir "$tmp"
+    echo '备份压缩包未通过校验，已停止操作。' >&2
+    return 1
+  fi
   chmod 0600 "$target"
   rm -f "$tmp/panel.sql" "$tmp/env.snapshot" "$tmp/domain.txt" "$tmp/manifest.txt"
   rmdir "$tmp"
@@ -103,6 +118,44 @@ restore() {
   echo '数据库已恢复。当前服务器的域名和数据库凭证保持不变。'
   echo '若迁移到新服务器，请在网站配置中更新节点后端 IP，并重新下发原版节点安装命令。'
 }
+install_panel() {
+  compose up -d --build
+  echo '面板已安装/重建，数据库卷保持不变。'
+}
+start_panel() {
+  compose up -d
+  echo '面板已启动。'
+}
+uninstall_panel() {
+  local confirm snapshot
+  if [[ -f $CADDY_SITE ]] && ! grep -Fq 'reverse_proxy 127.0.0.1:6366' "$CADDY_SITE"; then
+    echo 'Caddy 站点不是当前面板生成的配置，已停止卸载。' >&2
+    return 1
+  fi
+  [[ -r /dev/tty ]] || { echo '卸载需要交互式 SSH 终端。' >&2; return 1; }
+  echo '将备份数据库和配置到 /root，然后移除本项目的容器、数据卷、镜像、域名站点、源码及 mb 命令。'
+  echo 'Docker、Caddy、其他站点和系统 swap 会保留。'
+  read -r -p '输入 UNINSTALL 确认：' confirm </dev/tty
+  [[ $confirm == UNINSTALL ]] || { echo '已取消。'; return 1; }
+  snapshot=$(backup)
+  [[ -s $snapshot ]] || { echo '备份文件无效，已停止卸载。' >&2; return 1; }
+  echo "卸载前备份：$snapshot"
+  compose down --volumes
+  if [[ -f /etc/caddy/Caddyfile ]]; then
+    sed -i '\@^import /etc/caddy/nexus-panel.caddy$@d' /etc/caddy/Caddyfile
+  fi
+  rm -f "$CADDY_SITE" "$DOMAIN_FILE"
+  if command -v caddy >/dev/null && [[ -f /etc/caddy/Caddyfile ]] && systemctl is-active --quiet caddy; then
+    if caddy validate --config /etc/caddy/Caddyfile; then systemctl reload caddy; else
+      echo 'Caddy 其他站点配置检查失败，请手动检查后重载。' >&2
+    fi
+  fi
+  cd /
+  rm -r -- "$APP_DIR"
+  docker image rm nexus-panel/backend:local nexus-panel/frontend:local >/dev/null 2>&1 || true
+  rm -f /usr/local/bin/mb
+  echo "Nexus-panel 已卸载，备份保存在 $snapshot。需要重新安装时使用 README 的 root 安装命令。"
+}
 update_panel() {
   local snapshot
   snapshot=$(backup)
@@ -121,8 +174,8 @@ menu() {
   while true; do
     echo
     echo 'Nexus-panel | SSH 菜单（mb）'
-    echo '1) 服务状态  2) 更新程序  3) 更换面板域名  4) 备份压缩包'
-    echo '5) 恢复备份  6) 查看日志  7) 重启服务  8) 停用面板（保留数据）  0) 退出'
+    echo '1) 状态  2) 升级  3) 更换域名  4) 备份  5) 恢复'
+    echo '6) 日志  7) 重启  8) 停止（保留数据）  9) 启动/重装  10) 卸载  0) 退出'
     read -r -p '选择: ' choice
     case "$choice" in
       1) status ;;
@@ -133,6 +186,8 @@ menu() {
       6) compose logs --tail=80 backend frontend mysql ;;
       7) compose restart ;;
       8) compose down; echo '容器已停止，数据库卷与源代码已保留。' ;;
+      9) install_panel ;;
+      10) uninstall_panel; return ;;
       0) return ;;
       *) echo '选项无效' ;;
     esac
@@ -144,6 +199,11 @@ case ${1:-menu} in
   backup) backup ;;
   restore) restore "${2:-}" ;;
   status) status ;;
-  update) update_panel ;;
-  *) echo '用法：mb [menu|domain|backup|restore|status|update]' >&2; exit 2 ;;
+  update|upgrade) update_panel ;;
+  install|reinstall) install_panel ;;
+  start) start_panel ;;
+  restart) compose restart ;;
+  stop) compose down ;;
+  uninstall) uninstall_panel ;;
+  *) echo '用法：mb [menu|domain|backup|restore|status|update|install|start|restart|stop|uninstall]' >&2; exit 2 ;;
 esac

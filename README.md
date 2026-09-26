@@ -1,6 +1,6 @@
 # Nexus-panel
 
-以 [flux-panel](https://github.com/bqlpfy/flux-panel) 的面板端源码为基底维护的自托管转发面板。保留原有 React 页面、Spring Boot API、登录、用户、隧道、转发、限速、流量统计和计费功能。新增 Nexus-panel 品牌、源码构建的一键安装、Caddy HTTPS 域名反代，以及 `mb` SSH 管理菜单。上游代码基线和许可见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
+以 [flux-panel](https://github.com/bqlpfy/flux-panel) 的面板端源码为基底维护的自托管转发面板。保留原有 React 页面、Spring Boot API、登录、用户、隧道、转发、限速、流量统计和计费功能。新增 Nexus-panel 品牌、源码构建的一键安装、Caddy HTTPS 域名反代，以及含升级、备份、恢复和卸载的 `mb` SSH 管理菜单。上游代码基线和许可见 [NOTICE](NOTICE) 与 [LICENSE](LICENSE)。
 
 ## 转发引擎与节点
 
@@ -31,17 +31,19 @@ curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/panel_ins
 | 选项 | 功能 |
 | --- | --- |
 | 1 / 6 / 7 | 查看状态、日志、重启服务 |
-| 2 | 先备份数据库，再拉取本仓库更新并重建容器 |
+| 2 | 先备份，再拉取本仓库更新并重建容器（`mb update`） |
 | 3 | 更换面板域名，校验并重载 Caddy 配置 |
 | 4 | 生成 `/root/nexus-panel-backup-日期-编号.tar.gz` |
 | 5 | 从备份压缩包恢复数据库；操作前自动再做一次安全备份 |
-| 8 | 停止容器，保留数据库卷和源码 |
+| 8 | 停止容器，保留数据卷和源码（`mb stop`） |
+| 9 | 启动或按现有源码重装服务，不删除数据（`mb install`） |
+| 10 | 先备份，确认后卸载本项目容器、数据卷、镜像、源码和域名配置（`mb uninstall`） |
 
-备份包含 MySQL 数据、安装时的 `.env` 配置快照与域名记录。恢复时使用**当前机器**的域名和数据库凭证，避免新服务器 MySQL 卷与旧密码不匹配；SQL 导入失败时尝试回滚到操作前的备份。新服务器迁移：先在新服务器按上面的命令安装，将压缩包上传到 `/root`，运行 `mb` 选 5，填入完整路径；随后在面板“网站配置”更新节点后端地址并重新安装/指向现有节点。
+备份包含 MySQL 数据、安装时的 `.env` 配置快照与域名记录。`mb uninstall` 在移除新版数据前生成这类备份；保留 Docker、Caddy 及主机 swap，以免影响其他服务，卸载后可再次运行上方 root 一行命令。恢复时使用**当前机器**的域名和数据库凭证，避免新服务器 MySQL 卷与旧密码不匹配；SQL 导入失败时尝试回滚到操作前的备份。新服务器迁移：先在新服务器按上面的命令安装，将压缩包上传到 `/root`，运行 `mb` 选 5，填入完整路径；随后在面板“网站配置”更新节点后端地址并重新安装/指向现有节点。
 
 ## 与旧 Nexus-panel 的关系
 
-旧的 Python/SQLite Nexus-panel 与本项目的 Flux/MySQL 表结构不同，**不能直接用旧备份恢复到新版**。旧代码保留在 [`archive/pre-flux-20260926`](https://github.com/a2899882/Nexus-panel/tree/archive/pre-flux-20260926) 分支。安装器发现旧 `/opt/nexus-panel`、旧 systemd 服务或旧 Caddy 站点时会停止，不会覆盖旧数据库。请先使用旧菜单备份并规划停机，再全新安装；原有节点需按 Flux 的节点流程重新添加。仓库更新不会自动替换正在运行的线上面板。
+旧的 Python/SQLite Nexus-panel 与 Flux/MySQL 表结构不同，**不能直接把旧备份恢复到新版**。旧代码保留在 [`archive/pre-flux-20260926`](https://github.com/a2899882/Nexus-panel/tree/archive/pre-flux-20260926) 分支。安装器能识别旧版 `panel.py`、`/var/lib/nexus-panel`、旧 systemd 服务与指向 8765 端口的 Caddy 站点：先列出识别到的文件，要求在 SSH 输入 `MIGRATE`，停止旧面板并将源码、SQLite 数据及相关配置备份为 `/root/nexus-panel-legacy-日期-编号.tar.gz`；验证压缩包可读取后仅清理这些旧版文件，继续安装新版。遇到不符合旧版特征的文件会停止，不会覆盖它们。迁移备份只用于恢复旧版，新的面板需要重新添加 Flux 节点和数据。远程旧节点不由面板安装器删除。
 
 ## 本地源码
 
@@ -49,10 +51,10 @@ curl -fsSL https://raw.githubusercontent.com/a2899882/Nexus-panel/main/panel_ins
 - `springboot-backend/`：Flux 原版 Spring Boot API。
 - `gost.sql`：数据库模板；安装时生成带随机初始凭证的 `runtime/init.sql`。
 - `compose.yml`：构建源码镜像，运行 MySQL、后端与前端。
-- `panel_install.sh`、`scripts/mb.sh`：面板部署、域名、备份与恢复。
+- `panel_install.sh`、`scripts/mb.sh`、`scripts/legacy_cleanup.sh`：面板部署、旧版备份迁移、SSH 菜单、域名、备份与恢复。
 
 ```bash
-bash -n panel_install.sh scripts/mb.sh
+bash -n panel_install.sh scripts/mb.sh scripts/legacy_cleanup.sh
 python3 -m py_compile scripts/*.py
 ```
 
