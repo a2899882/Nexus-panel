@@ -4,6 +4,7 @@ WORKDIR /app
 COPY pom.xml .
 COPY src ./src
 RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && mkdir -p src/main/resources/fonts \
     && cp /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc src/main/resources/fonts/NotoSansCJK-Regular.ttc \
     && rm -rf /var/lib/apt/lists/*
 RUN mvn clean package -DskipTests
